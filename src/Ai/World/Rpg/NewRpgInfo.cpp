@@ -6,31 +6,31 @@
 
 void NewRpgInfo::ChangeToGoGrind(WorldPosition pos)
 {
-    startT = getMSTime();
+    Reset();
     data = GoGrind{pos};
 }
 
 void NewRpgInfo::ChangeToGoCamp(WorldPosition pos)
 {
-    startT = getMSTime();
+    Reset();
     data = GoCamp{pos};
 }
 
 void NewRpgInfo::ChangeToWanderNpc()
 {
-    startT = getMSTime();
+    Reset();
     data = WanderNpc{};
 }
 
 void NewRpgInfo::ChangeToWanderRandom()
 {
-    startT = getMSTime();
+    Reset();
     data = WanderRandom{};
 }
 
 void NewRpgInfo::ChangeToDoQuest(uint32 questId, const Quest* quest)
 {
-    startT = getMSTime();
+    Reset();
     DoQuest do_quest;
     do_quest.questId = questId;
     do_quest.quest = quest;
@@ -39,7 +39,7 @@ void NewRpgInfo::ChangeToDoQuest(uint32 questId, const Quest* quest)
 
 void NewRpgInfo::ChangeToTravelFlight(uint32 flightMasterEntry, WorldPosition flightMasterPos, std::vector<uint32> path)
 {
-    startT = getMSTime();
+    Reset();
     TravelFlight flight;
     flight.flightMasterEntry = flightMasterEntry;
     flight.flightMasterPos = flightMasterPos;
@@ -58,13 +58,13 @@ void NewRpgInfo::ChangeToOutdoorPvp(ObjectGuid::LowType capturePointSpawnId)
 
 void NewRpgInfo::ChangeToRest()
 {
-    startT = getMSTime();
+    Reset();
     data = Rest{};
 }
 
 void NewRpgInfo::ChangeToIdle()
 {
-    startT = getMSTime();
+    Reset();
     data = Idle{};
 }
 
@@ -77,14 +77,7 @@ void NewRpgInfo::Reset()
 {
     data = Idle{};
     startT = getMSTime();
-}
-
-void NewRpgInfo::SetMoveFarTo(WorldPosition pos)
-{
-    nearestMoveFarDis = FLT_MAX;
-    stuckTs = 0;
-    stuckAttempts = 0;
-    moveFarPos = pos;
+    ClearTravel();
 }
 
 NewRpgStatus NewRpgInfo::GetStatus()

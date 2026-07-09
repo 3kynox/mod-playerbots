@@ -126,7 +126,12 @@ bool OutNumberedTrigger::IsActive()
         return false;
 
     int32 botLevel = bot->GetLevel();
-    uint32 friendPower = 200;
+    // Weight by health so being "outnumbered" DE-ESCALATES as the fight
+    // progresses: friend power drops as the bot is hurt, and each foe
+    // contributes in proportion to its remaining health. A pack the bot has
+    // already whittled down no longer trips flee, so it finishes the mobs
+    // one by one instead of fleeing back through them and pulling more.
+    uint32 friendPower = 100 + uint32(100.0f * bot->GetHealthPct() / 100.0f);
     uint32 foePower = 0;
     for (auto& attacker : botAI->GetAiObjectContext()->GetValue<GuidVector>("attackers")->Get())
     {
@@ -136,7 +141,7 @@ bool OutNumberedTrigger::IsActive()
 
         int32 dLevel = creature->GetLevel() - botLevel;
         if (dLevel > -10)
-            foePower = std::max(100 + 10 * dLevel, dLevel * 200);
+            foePower += uint32(std::max(100 + 10 * dLevel, dLevel * 200) * creature->GetHealthPct() / 100.0f);  // accumulate, weighted by foe health
     }
 
     if (!foePower)

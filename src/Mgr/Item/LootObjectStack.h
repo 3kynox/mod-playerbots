@@ -26,7 +26,7 @@ public:
 class LootObject
 {
 public:
-    LootObject() : skillId(0), reqSkillValue(0), reqItem(0) {}
+    LootObject() : skillId(0), reqSkillValue(0), reqItem(0), isNeededQuestItem(false) {}
     LootObject(Player* bot, ObjectGuid guid);
     LootObject(LootObject const& other);
     LootObject& operator=(LootObject const& other) = default;
@@ -40,6 +40,9 @@ public:
     uint32 skillId;
     uint32 reqSkillValue;
     uint32 reqItem;
+    // GO holds a quest item we still need; lets us bypass the
+    // INTERACT_COND blanket reject in the loot path
+    bool isNeededQuestItem;
 
 private:
     static bool IsNeededForQuest(Player* bot, uint32 itemId);
@@ -73,6 +76,7 @@ public:
 
     bool Add(ObjectGuid guid);
     void Remove(ObjectGuid guid);
+    void MarkCompleted(ObjectGuid guid);
     void Clear();
     bool CanLoot(float maxDistance);
     LootObject GetLoot(float maxDistance = 0);
@@ -82,6 +86,9 @@ private:
 
     Player* bot;
     LootTargetList availableLoot;
+    // Guids we already opened loot on; blocks "add all loot" from
+    // re-adding the same corpse before it despawns.
+    LootTargetList completedLoot;
 };
 
 #endif

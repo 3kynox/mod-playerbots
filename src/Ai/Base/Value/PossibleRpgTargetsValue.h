@@ -47,7 +47,13 @@ public:
     {
         if (allowedGOFlags.empty())
         {
+            // questgivers for accept/turn-in; rest for quest progression
+            // (chests, runes, altars, moonwells, lily piles, …)
             allowedGOFlags.push_back(GAMEOBJECT_TYPE_QUESTGIVER);
+            allowedGOFlags.push_back(GAMEOBJECT_TYPE_CHEST);
+            allowedGOFlags.push_back(GAMEOBJECT_TYPE_GOOBER);
+            allowedGOFlags.push_back(GAMEOBJECT_TYPE_SPELL_FOCUS);
+            allowedGOFlags.push_back(GAMEOBJECT_TYPE_GENERIC);
         }
     }
 

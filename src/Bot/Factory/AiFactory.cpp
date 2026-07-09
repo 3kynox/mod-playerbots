@@ -285,7 +285,7 @@ void AiFactory::AddDefaultCombatStrategies(Player* player, PlayerbotAI* const fa
     uint8 tab = GetPlayerSpecTab(player);
 
     if (!player->InBattleground())
-        engine->addStrategiesNoInit("racials", "chat", "default", "cast time", "potions", "duel", "boost", nullptr);
+        engine->addStrategiesNoInit("racials", "chat", "default", "cast time", "potions", "duel", "boost", "flee", nullptr);
 
     if (sPlayerbotAIConfig.autoAvoidAoe && facade->HasRealPlayerMaster())
         engine->addStrategy("avoid aoe", false);

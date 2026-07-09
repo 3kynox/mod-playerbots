@@ -72,7 +72,6 @@ bool PlayerbotAIConfig::Initialize()
     globalCoolDown = sConfigMgr->GetOption<int32>("AiPlayerbot.GlobalCooldown", 500);
     maxWaitForMove = sConfigMgr->GetOption<int32>("AiPlayerbot.MaxWaitForMove", 5000);
     disableMoveSplinePath = sConfigMgr->GetOption<int32>("AiPlayerbot.DisableMoveSplinePath", 0);
-    maxMovementSearchTime = sConfigMgr->GetOption<int32>("AiPlayerbot.MaxMovementSearchTime", 3);
     expireActionTime = sConfigMgr->GetOption<int32>("AiPlayerbot.ExpireActionTime", 5000);
     dispelAuraDuration = sConfigMgr->GetOption<int32>("AiPlayerbot.DispelAuraDuration", 700);
     reactDelay = sConfigMgr->GetOption<int32>("AiPlayerbot.ReactDelay", 100);
@@ -96,14 +95,39 @@ bool PlayerbotAIConfig::Initialize()
     fleeDistance = sConfigMgr->GetOption<float>("AiPlayerbot.FleeDistance", 5.0f);
     aggroDistance = sConfigMgr->GetOption<float>("AiPlayerbot.AggroDistance", 22.0f);
     tooCloseDistance = sConfigMgr->GetOption<float>("AiPlayerbot.TooCloseDistance", 5.0f);
+    transportTeleportType = sConfigMgr->GetOption<uint32>("AiPlayerbot.TransportTeleportType", 2);
     meleeDistance = sConfigMgr->GetOption<float>("AiPlayerbot.MeleeDistance", 0.75f);
     followDistance = sConfigMgr->GetOption<float>("AiPlayerbot.FollowDistance", 1.5f);
+    walkDistance = sConfigMgr->GetOption<float>("AiPlayerbot.WalkDistance", 5.0f);
     whisperDistance = sConfigMgr->GetOption<float>("AiPlayerbot.WhisperDistance", 6000.0f);
     contactDistance = sConfigMgr->GetOption<float>("AiPlayerbot.ContactDistance", 0.45f);
     aoeRadius = sConfigMgr->GetOption<float>("AiPlayerbot.AoeRadius", 10.0f);
     rpgDistance = sConfigMgr->GetOption<float>("AiPlayerbot.RpgDistance", 200.0f);
     grindDistance = sConfigMgr->GetOption<float>("AiPlayerbot.GrindDistance", 75.0f);
+    // Free-move leash (port of cmangos free-move-range): the radius a bot
+    // may range from its anchor (itself when solo/wandering, its master
+    // when following) to SELECT a grind/attack target. Stops a bot striking
+    // out past nearer mobs toward a distant one or a far camp. 0 disables.
+    wanderMaxDistance = sConfigMgr->GetOption<float>("AiPlayerbot.WanderMaxDistance", 50.0f);
+    guardDistance = sConfigMgr->GetOption<float>("AiPlayerbot.GuardDistance", sightDistance);
     reactDistance = sConfigMgr->GetOption<float>("AiPlayerbot.ReactDistance", 150.0f);
+    // Steep-slope travel policy. The core bot nav filter hard-excludes
+    // 50-60deg NAV_GROUND_STEEP and cannot re-include it (no
+    // SetIncludeFlags), so a bot wedges when the ONLY route to a target
+    // runs along such a slope (a mountain edge leading to a ledge NPC).
+    // When a bot's travel path finds NO route, it retries through a temp
+    // creature (whose filter DOES include steep) at this Detour area
+    // cost, so the bot follows the steep edge as a last resort. A high
+    // value keeps bots off steep whenever any flatter route exists; the
+    // >60deg cliff has no navmesh so the top stays uncrossable. Set 0 to
+    // restore strict hard-exclude (bots never touch steep, but wedge at
+    // such targets). Travel pathing only; combat is unchanged.
+    // 100: a steep yard costs as much as 100 flat yards, so any existing
+    // way around always beats crossing a ridge; steep is used only when
+    // NO flat route exists at all (a ledge NPC's approach). 20 proved too
+    // low — a short steep crossing could out-score a long flat detour and
+    // bots cut over mountains again.
+    botSteepTravelCost = sConfigMgr->GetOption<float>("AiPlayerbot.BotSteepTravelCost", 100.0f);
 
     criticalHealth = sConfigMgr->GetOption<int32>("AiPlayerbot.CriticalHealth", 25);
     lowHealth = sConfigMgr->GetOption<int32>("AiPlayerbot.LowHealth", 45);

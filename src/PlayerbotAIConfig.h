@@ -91,12 +91,14 @@ public:
     bool EnableICCBuffs;
     bool allowAccountBots, allowGuildBots, allowTrustedAccountBots;
     bool randomBotGuildNearby, randomBotInvitePlayer, inviteChat;
-    uint32 globalCoolDown, reactDelay, maxWaitForMove, disableMoveSplinePath, maxMovementSearchTime, expireActionTime,
+    uint32 globalCoolDown, reactDelay, maxWaitForMove, disableMoveSplinePath, expireActionTime,
         dispelAuraDuration, passiveDelay, repeatDelay, errorDelay, rpgDelay, sitDelay, returnDelay, lootDelay;
     bool dynamicReactDelay;
     float sightDistance, spellDistance, reactDistance, grindDistance, lootDistance, shootDistance, fleeDistance,
         tooCloseDistance, meleeDistance, followDistance, whisperDistance, contactDistance, aoeRadius, rpgDistance,
-        targetPosRecalcDistance, farDistance, healDistance, aggroDistance;
+        targetPosRecalcDistance, farDistance, healDistance, aggroDistance, walkDistance, botSteepTravelCost,
+        wanderMaxDistance, guardDistance;
+    uint32 transportTeleportType;
     uint32 criticalHealth, lowHealth, mediumHealth, almostFullHealth;
     uint32 lowMana, mediumMana, highMana;
     bool autoSaveMana;
