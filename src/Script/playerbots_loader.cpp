@@ -17,6 +17,11 @@
 
 // From SC
 void AddPlayerbotsScripts();
+void AddPlayerbotsClusterScripts();
 
 // Add all
-void Addmod_playerbotsScripts() { AddPlayerbotsScripts(); }
+void Addmod_playerbotsScripts()
+{
+    AddPlayerbotsScripts();
+    AddPlayerbotsClusterScripts();
+}
