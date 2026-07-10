@@ -145,8 +145,14 @@ namespace PlayerbotsCluster
 
     bool ShouldSkipPoolCandidate(uint32 mapId)
     {
+        // Strict partition: only pick characters saved on maps this
+        // worldserver owns. Characters on maps served by nobody (e.g.
+        // blood elf/draenei starters while no shard owns map 530) stay
+        // benched until a shard owns their map: re-randomizing them is
+        // unreliable (RandomTeleportForLevel has no valid location for
+        // some level/race combos and can land outside randomBotMaps,
+        // observed as kalimdor bots leaking to map 0).
         return sToCloud9Sidecar->ClusterModeEnabled()
-            && IsMapServedByClusterBots(mapId)
             && !sToCloud9Sidecar->IsMapAssigned(mapId);
     }
 }
