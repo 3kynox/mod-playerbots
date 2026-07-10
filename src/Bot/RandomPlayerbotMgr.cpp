@@ -13,6 +13,7 @@
 #include <ctime>
 #include <iomanip>
 #include <random>
+#include <unordered_map>
 
 #include "AiFactory.h"
 #include "Battleground.h"
@@ -35,6 +36,7 @@
 #include "PlayerbotAIConfig.h"
 #include "PlayerbotFactory.h"
 #include "PlayerbotTextMgr.h"
+#include "PlayerbotsCluster.h"
 #include "Playerbots.h"
 #include "Position.h"
 #include "RaceMgr.h"
@@ -685,6 +687,32 @@ uint32 RandomPlayerbotMgr::AddRandomBots()
             accountsToUse = rndBotTypeAccounts;
         }
 
+        // ToCloud9 cluster: a character saved on a map owned by another
+        // worldserver must be logged in there (its pool picks it up);
+        // selecting it here would only churn through kick/handoff cycles.
+        // Grab the saved maps once to filter the candidates below.
+        std::unordered_map<uint32, uint32> charSavedMaps;
+        if (PlayerbotsCluster::PoolFilterActive() && !accountsToUse.empty())
+        {
+            std::string accountsCsv;
+            for (uint32 accountId : accountsToUse)
+            {
+                if (!accountsCsv.empty())
+                    accountsCsv += ',';
+                accountsCsv += std::to_string(accountId);
+            }
+
+            if (QueryResult mapsResult = CharacterDatabase.Query(
+                    "SELECT guid, map FROM characters WHERE account IN ({})", accountsCsv))
+            {
+                do
+                {
+                    Field* fields = mapsResult->Fetch();
+                    charSavedMaps[fields[0].Get<uint32>()] = fields[1].Get<uint16>();
+                } while (mapsResult->NextRow());
+            }
+        }
+
         // Pre-map all characters from selected accounts
         struct CharacterInfo
         {
@@ -712,6 +740,12 @@ uint32 RandomPlayerbotMgr::AddRandomBots()
                 info.rClass = fields[1].Get<uint8>();
                 info.rRace = fields[2].Get<uint8>();
                 info.accountId = accountId;
+
+                auto savedMap = charSavedMaps.find(info.guid);
+                if (savedMap != charSavedMaps.end() &&
+                    PlayerbotsCluster::ShouldSkipPoolCandidate(savedMap->second))
+                    continue;
+
                 allCharacters.push_back(info);
             } while (result->NextRow());
         }

@@ -28,6 +28,7 @@
 #include "ObjectGuid.h"
 #include "Player.h"
 #include "PlayerbotAIConfig.h"
+#include "PlayerbotsCluster.h"
 #include "RandomPlayerbotMgr.h"
 #include "ScriptMgr.h"
 #include "TC9Sidecar.h"
@@ -83,6 +84,21 @@ namespace
                 return;
 
         clusterPendingLogins.push_back({guidLow, mapId, int32(CLUSTER_LOGIN_DELAY_MS)});
+    }
+}
+
+namespace PlayerbotsCluster
+{
+    bool PoolFilterActive()
+    {
+        return sToCloud9Sidecar->ClusterModeEnabled();
+    }
+
+    bool ShouldSkipPoolCandidate(uint32 mapId)
+    {
+        return sToCloud9Sidecar->ClusterModeEnabled()
+            && IsMapServedByClusterBots(mapId)
+            && !sToCloud9Sidecar->IsMapAssigned(mapId);
     }
 }
 
@@ -188,6 +204,12 @@ private:
                 // bring the bot back onto a map this worldserver owns.
                 LOG_INFO("playerbots", "Cluster: re-randomizing bot {} from unserved map {}", bot->GetName(), mapId);
                 sRandomPlayerbotMgr.RandomTeleportForLevel(bot);
+                // Persist the new position now: the pool can log the bot out
+                // before the next periodic save, which would leave the stale
+                // unserved map in the DB and re-trigger this path forever.
+                // (During a far teleport this schedules DELAYED_SAVE_PLAYER,
+                // executed on arrival with the destination map.)
+                bot->SaveToDB(false, false);
             }
         }
     }
