@@ -14,6 +14,7 @@
 #include <iomanip>
 #include <random>
 #include <unordered_map>
+#include <unordered_set>
 
 #include "AiFactory.h"
 #include "Battleground.h"
@@ -2207,6 +2208,8 @@ void RandomPlayerbotMgr::GetBots()
     stmt->SetData(0, 0);
     stmt->SetData(1, "add");
     uint32 maxAllowedBotCount = GetEventValue(0, "bot_count");
+
+    std::vector<uint32> candidates;
     if (PreparedQueryResult result = PlayerbotsDatabase.Query(stmt))
     {
         do
@@ -2214,11 +2217,46 @@ void RandomPlayerbotMgr::GetBots()
             Field* fields = result->Fetch();
             uint32 bot = fields[0].Get<uint32>();
             if (GetEventValue(bot, "add"))
-                currentBots.push_back(bot);
-
-            if (currentBots.size() >= maxAllowedBotCount)
-                break;
+                candidates.push_back(bot);
         } while (result->NextRow());
+    }
+
+    // ToCloud9 cluster: the "add" events table is shared by every shard, so
+    // rebuilding from it would materialize characters owned by other
+    // worldservers (their own copy stays there, ours gets kicked/handed off
+    // in a loop). Only keep characters saved on maps this worldserver owns.
+    if (PlayerbotsCluster::PoolFilterActive() && !candidates.empty())
+    {
+        std::string guidsCsv;
+        for (uint32 guid : candidates)
+        {
+            if (!guidsCsv.empty())
+                guidsCsv += ',';
+            guidsCsv += std::to_string(guid);
+        }
+
+        std::unordered_set<uint32> foreign;
+        if (QueryResult result = CharacterDatabase.Query(
+                "SELECT guid, map FROM characters WHERE guid IN ({})", guidsCsv))
+        {
+            do
+            {
+                Field* fields = result->Fetch();
+                if (PlayerbotsCluster::ShouldSkipPoolCandidate(fields[1].Get<uint16>()))
+                    foreign.insert(fields[0].Get<uint32>());
+            } while (result->NextRow());
+        }
+
+        candidates.erase(std::remove_if(candidates.begin(), candidates.end(),
+                             [&foreign](uint32 guid) { return foreign.count(guid) != 0; }),
+                         candidates.end());
+    }
+
+    for (uint32 bot : candidates)
+    {
+        currentBots.push_back(bot);
+        if (currentBots.size() >= maxAllowedBotCount)
+            break;
     }
 }
 
