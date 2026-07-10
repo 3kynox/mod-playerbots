@@ -37,12 +37,14 @@
 #include <algorithm>
 #include <cstdio>
 #include <mutex>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
 namespace
 {
     constexpr char CLUSTER_LOGIN_REQUEST_SUBJECT[] = "playerbots.login-request";
+    constexpr char GROUP_INVITE_CREATED_SUBJECT[] = "group.invite.created";
     constexpr uint32 CLUSTER_KICK_COOLDOWN_MS = 30 * 1000;  // per bot, breaks kick<->handoff loops
     constexpr uint32 CLUSTER_LOGIN_DELAY_MS = 2 * 1000;     // lets the sender's logout save reach the DB
 
@@ -84,6 +86,53 @@ namespace
                 return;
 
         clusterPendingLogins.push_back({guidLow, mapId, int32(CLUSTER_LOGIN_DELAY_MS)});
+    }
+
+    // Minimal extractor for one numeric field of the groupserver JSON events
+    // (envelope {"v":...,"t":...,"p":{...}} built by EventToSendGenericPayload).
+    bool ExtractJsonUInt64(std::string const& json, char const* key, uint64& out)
+    {
+        std::string needle = std::string("\"") + key + "\":";
+        size_t pos = json.find(needle);
+        if (pos == std::string::npos)
+            return false;
+
+        return sscanf(json.c_str() + pos + needle.size(), "%llu", (unsigned long long*)&out) == 1;
+    }
+
+    // Runs on the world thread (delivered through ProcessHooks). The group
+    // service created an invite for a character without gateway session; if
+    // that character is one of our local random bots, accept on its behalf
+    // (BUG-022: the SMSG_GROUP_INVITE only reaches gateway sessions).
+    void OnClusterGroupInviteCreated(char const* /*subject*/, char const* payload, int payloadLen)
+    {
+        if (!sPlayerbotAIConfig.enabled)
+            return;
+
+        std::string data(payload, payloadLen);
+        uint64 inviteeGUID = 0;
+        if (!ExtractJsonUInt64(data, "InviteeGUID", inviteeGUID) || !inviteeGUID)
+            return;
+
+        Player* bot = ObjectAccessor::FindPlayer(
+            ObjectGuid::Create<HighGuid::Player>(ObjectGuid::LowType(inviteeGUID)));
+        if (!bot || !bot->GetSession() || !bot->GetSession()->IsBot())
+            return;  // not one of our in-process sessions (real players use the gateway)
+
+        if (!sRandomPlayerbotMgr.IsRandomBot(bot))
+            return;  // alt bots follow their master's grouping, not public invites
+
+        if (bot->GetGroup())
+            return;  // already grouped (local mirror fed by group.* events)
+
+        LOG_INFO("playerbots", "Cluster: accepting group invite for bot {}", bot->GetName());
+
+        // Blocking gRPC call: keep it off the world thread. Group state comes
+        // back asynchronously through the group.created/member.added events.
+        uint64 guidCounter = bot->GetGUID().GetCounter();
+        std::thread([guidCounter]() {
+            sToCloud9Sidecar->GroupAcceptInvite(guidCounter);
+        }).detach();
     }
 }
 
@@ -141,7 +190,9 @@ public:
             return;
 
         if (!clusterSubscribed && sPlayerbotAIConfig.enabled)
-            clusterSubscribed = sToCloud9Sidecar->NatsSubscribe(CLUSTER_LOGIN_REQUEST_SUBJECT, &OnClusterLoginRequest);
+            clusterSubscribed =
+                sToCloud9Sidecar->NatsSubscribe(CLUSTER_LOGIN_REQUEST_SUBJECT, &OnClusterLoginRequest) &&
+                sToCloud9Sidecar->NatsSubscribe(GROUP_INVITE_CREATED_SUBJECT, &OnClusterGroupInviteCreated);
 
         UpdateCooldowns(diff);
         ProcessPendingKicks();
