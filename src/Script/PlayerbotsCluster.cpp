@@ -28,6 +28,7 @@
 #include "ObjectGuid.h"
 #include "Player.h"
 #include "PlayerbotAIConfig.h"
+#include "Playerbots.h"
 #include "PlayerbotsCluster.h"
 #include "RandomPlayerbotMgr.h"
 #include "ScriptMgr.h"
@@ -294,8 +295,54 @@ private:
     }
 };
 
+// Cluster equivalent of the post-accept block in AcceptInvitationAction:
+// behind the gateway, bots never receive SMSG_GROUP_INVITE, they join
+// through the group service and the local mirror (Group::AddMember fires
+// this hook on the world thread). Without it the bot is linked to the
+// group but keeps its random strategies (grind/travel) and never follows.
+class PlayerbotsClusterGroupScript : public GroupScript
+{
+public:
+    PlayerbotsClusterGroupScript() : GroupScript("PlayerbotsClusterGroupScript", {
+        GROUPHOOK_ON_ADD_MEMBER
+    }) {}
+
+    void OnAddMember(Group* group, ObjectGuid guid) override
+    {
+        if (!sPlayerbotAIConfig.enabled || !sToCloud9Sidecar->ClusterModeEnabled())
+            return;
+
+        Player* bot = ObjectAccessor::FindPlayer(guid);
+        if (!bot || !bot->GetSession() || !bot->GetSession()->IsBot())
+            return;
+
+        if (!sRandomPlayerbotMgr.IsRandomBot(bot))
+            return;  // alt bots already obey their owner
+
+        PlayerbotAI* botAI = GET_PLAYERBOT_AI(bot);
+        if (!botAI)
+            return;
+
+        // Only obey a real player hosted on this shard: bot-led groups keep
+        // the vanilla behavior, and a cross-shard leader has no local Player
+        // to follow anyway.
+        Player* leader = ObjectAccessor::FindPlayer(group->GetLeaderGUID());
+        if (!leader || leader == bot || GET_PLAYERBOT_AI(leader))
+            return;
+
+        LOG_INFO("playerbots", "Cluster: bot {} grouped with {}, switching to follow", bot->GetName(), leader->GetName());
+
+        botAI->SetMaster(leader);
+        botAI->ResetStrategies();
+        botAI->ChangeStrategy("+follow,-lfg,-bg", BOT_STATE_NON_COMBAT);
+        botAI->Reset();
+        botAI->TellMaster("Hello");
+    }
+};
+
 void AddPlayerbotsClusterScripts()
 {
     new PlayerbotsClusterPlayerScript();
     new PlayerbotsClusterWorldScript();
+    new PlayerbotsClusterGroupScript();
 }
