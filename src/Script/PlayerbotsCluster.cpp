@@ -377,6 +377,7 @@ public:
                 return;
             }
 
+        std::vector<uint64> altsToLeave;
         for (Group::MemberSlot const& slot : group->GetMemberSlots())
         {
             if (slot.guid == guid)
@@ -394,13 +395,21 @@ public:
             LOG_INFO("playerbots", "Cluster: owner left group {}, alt bot {} leaves too",
                      group->GetGUID().GetCounter(), bot->GetName());
 
-            // Blocking gRPC call: keep it off the world thread (same pattern
-            // as the invite accept).
-            uint64 guidCounter = bot->GetGUID().GetCounter();
-            std::thread([guidCounter]() {
-                sToCloud9Sidecar->GroupLeave(guidCounter);
-            }).detach();
+            altsToLeave.push_back(bot->GetGUID().GetCounter());
         }
+
+        if (altsToLeave.empty())
+            return;
+
+        // Blocking gRPC calls: keep them off the world thread, and SEQUENTIAL
+        // on purpose - concurrent Leave calls race in the group service
+        // (double disband panic, lost member removals). The last leave can
+        // come back "group not found" once the service disbands the group
+        // under 2 members; that's expected.
+        std::thread([altsToLeave]() {
+            for (uint64 altGuid : altsToLeave)
+                sToCloud9Sidecar->GroupLeave(altGuid);
+        }).detach();
     }
 
     // Catch-all: the group service disbands the group once it falls under 2
