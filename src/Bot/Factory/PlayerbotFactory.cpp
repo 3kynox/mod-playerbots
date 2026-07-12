@@ -36,6 +36,7 @@
 #include "ReputationMgr.h"
 #include "SharedDefines.h"
 #include "StatsWeightCalculator.h"
+#include "TC9Sidecar.h"
 #include "World.h"
 #include "AiObjectContext.h"
 #include "ItemPackets.h"
@@ -4611,6 +4612,15 @@ void PlayerbotFactory::InitGuild()
             StoreItem(5976, 1);
         return;
     }
+
+    // Multi-shard cluster: another worldserver may already have persisted this
+    // bot's membership while this shard's in-memory guild (loaded at boot,
+    // never resynced) does not know it — AddMember would then re-INSERT
+    // guild_member and spam 1062 at every bot login (BUG-TC9-023). Trust the
+    // shared DB over the local mirror.
+    if (sToCloud9Sidecar->ClusterModeEnabled() &&
+        CharacterDatabase.Query("SELECT 1 FROM guild_member WHERE guid = {}", bot->GetGUID().GetCounter()))
+        return;
 
     std::string guildName = PlayerbotGuildMgr::instance().AssignToGuild(bot);
     if (guildName.empty())
