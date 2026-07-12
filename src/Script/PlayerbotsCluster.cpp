@@ -121,7 +121,18 @@ namespace
             return;  // not one of our in-process sessions (real players use the gateway)
 
         if (!sRandomPlayerbotMgr.IsRandomBot(bot))
-            return;  // alt bots follow their master's grouping, not public invites
+        {
+            // Alt bots mirror vanilla AcceptInvitationAction: only their owner
+            // may pull them into a group (cluster stand-in for the
+            // PLAYERBOT_SECURITY_INVITE check — the inviter can be cross-shard,
+            // so compare GUIDs instead of resolving a local Player).
+            PlayerbotAI* botAI = GET_PLAYERBOT_AI(bot);
+            uint64 inviterGUID = 0;
+            if (!botAI || !botAI->GetMaster() ||
+                !ExtractJsonUInt64(data, "InviterGUID", inviterGUID) ||
+                botAI->GetMaster()->GetGUID().GetCounter() != ObjectGuid::LowType(inviterGUID))
+                return;
+        }
 
         if (bot->GetGroup())
             return;  // already grouped (local mirror fed by group.* events)
@@ -316,9 +327,6 @@ public:
         if (!bot || !bot->GetSession() || !bot->GetSession()->IsBot())
             return;
 
-        if (!sRandomPlayerbotMgr.IsRandomBot(bot))
-            return;  // alt bots already obey their owner
-
         PlayerbotAI* botAI = GET_PLAYERBOT_AI(bot);
         if (!botAI)
             return;
@@ -330,9 +338,16 @@ public:
         if (!leader || leader == bot || GET_PLAYERBOT_AI(leader))
             return;
 
+        bool isRandomBot = sRandomPlayerbotMgr.IsRandomBot(bot);
+        if (!isRandomBot && botAI->GetMaster() != leader)
+            return;  // alt bots only follow their owner
+
         LOG_INFO("playerbots", "Cluster: bot {} grouped with {}, switching to follow", bot->GetName(), leader->GetName());
 
-        botAI->SetMaster(leader);
+        // Alt bots keep their owner as master (vanilla AcceptInvitationAction
+        // only rebinds the master for random bots).
+        if (isRandomBot)
+            botAI->SetMaster(leader);
         botAI->ResetStrategies();
         botAI->ChangeStrategy("+follow,-lfg,-bg", BOT_STATE_NON_COMBAT);
         botAI->Reset();
