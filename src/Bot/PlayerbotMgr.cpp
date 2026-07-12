@@ -34,6 +34,7 @@
 #include "PlayerbotGuildMgr.h"
 #include "RandomPlayerbotMgr.h"
 #include "SharedDefines.h"
+#include "TC9Sidecar.h"
 #include "WorldSession.h"
 #include "BroadcastHelper.h"
 #include "WorldSessionMgr.h"
@@ -550,8 +551,12 @@ void PlayerbotHolder::OnBotLogin(Player* const bot)
     botAI->TellMaster(PlayerbotTextMgr::instance().GetBotTextOrDefault(
         "hello", "Hello!", {}), PLAYERBOT_SECURITY_TALK);
 
-    // Queue group operations for world thread
-    if (master && master->GetGroup() && !group)
+    // Queue group operations for world thread. Cluster mode: skip — these
+    // in-process Group writes bypass the group service and leave phantom
+    // rows it later collides with (1062, BUG-TC9-013); the owner invites
+    // explicitly and PlayerbotsCluster accepts through the service.
+    bool inProcessGrouping = !sToCloud9Sidecar->ClusterModeEnabled();
+    if (inProcessGrouping && master && master->GetGroup() && !group)
     {
         Group* mgroup = master->GetGroup();
         if (mgroup->GetMembersCount() >= 5)
@@ -575,7 +580,7 @@ void PlayerbotHolder::OnBotLogin(Player* const bot)
             PlayerbotWorldThreadProcessor::instance().QueueOperation(std::move(addOp));
         }
     }
-    else if (master && !group)
+    else if (inProcessGrouping && master && !group)
     {
         // Queue group creation and AddMember operation
         auto inviteOp = std::make_unique<GroupInviteOperation>(master->GetGUID(), bot->GetGUID());
