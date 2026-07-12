@@ -315,7 +315,9 @@ class PlayerbotsClusterGroupScript : public GroupScript
 {
 public:
     PlayerbotsClusterGroupScript() : GroupScript("PlayerbotsClusterGroupScript", {
-        GROUPHOOK_ON_ADD_MEMBER
+        GROUPHOOK_ON_ADD_MEMBER,
+        GROUPHOOK_ON_REMOVE_MEMBER,
+        GROUPHOOK_ON_DISBAND
     }) {}
 
     void OnAddMember(Group* group, ObjectGuid guid) override
@@ -352,6 +354,84 @@ public:
         botAI->ChangeStrategy("+follow,-lfg,-bg", BOT_STATE_NON_COMBAT);
         botAI->Reset();
         botAI->TellMaster("Hello");
+    }
+
+    // A client "disband" is a Leave of the player (WoW semantics): the group
+    // survives while >= 2 bots remain, stranding the alts grouped together
+    // and unable to be re-invited (BUG-027). When the removed member is the
+    // owner of local alt bots still in the group, make each alt leave through
+    // the group service; their own removal (or the final disband) then puts
+    // them back on follow.
+    void OnRemoveMember(Group* group, ObjectGuid guid, RemoveMethod /*method*/,
+                        ObjectGuid /*kicker*/, char const* /*reason*/) override
+    {
+        if (!sPlayerbotAIConfig.enabled || !sToCloud9Sidecar->ClusterModeEnabled())
+            return;
+
+        // The removed member is one of our local alt bots (owner uninvite or
+        // our own GroupLeave below): resume following its owner.
+        if (Player* bot = ObjectAccessor::FindPlayer(guid))
+            if (bot->GetSession() && bot->GetSession()->IsBot() && !sRandomPlayerbotMgr.IsRandomBot(bot))
+            {
+                ResumeFollowingOwner(bot);
+                return;
+            }
+
+        for (Group::MemberSlot const& slot : group->GetMemberSlots())
+        {
+            if (slot.guid == guid)
+                continue;
+
+            Player* bot = ObjectAccessor::FindPlayer(slot.guid);
+            if (!bot || !bot->GetSession() || !bot->GetSession()->IsBot() ||
+                sRandomPlayerbotMgr.IsRandomBot(bot))
+                continue;
+
+            PlayerbotAI* botAI = GET_PLAYERBOT_AI(bot);
+            if (!botAI || !botAI->GetMaster() || botAI->GetMaster()->GetGUID() != guid)
+                continue;
+
+            LOG_INFO("playerbots", "Cluster: owner left group {}, alt bot {} leaves too",
+                     group->GetGUID().GetCounter(), bot->GetName());
+
+            // Blocking gRPC call: keep it off the world thread (same pattern
+            // as the invite accept).
+            uint64 guidCounter = bot->GetGUID().GetCounter();
+            std::thread([guidCounter]() {
+                sToCloud9Sidecar->GroupLeave(guidCounter);
+            }).detach();
+        }
+    }
+
+    // Catch-all: the group service disbands the group once it falls under 2
+    // members; free every local alt bot still linked to it.
+    void OnDisband(Group* group) override
+    {
+        if (!sPlayerbotAIConfig.enabled || !sToCloud9Sidecar->ClusterModeEnabled())
+            return;
+
+        for (Group::MemberSlot const& slot : group->GetMemberSlots())
+        {
+            Player* bot = ObjectAccessor::FindPlayer(slot.guid);
+            if (bot && bot->GetSession() && bot->GetSession()->IsBot() &&
+                !sRandomPlayerbotMgr.IsRandomBot(bot))
+                ResumeFollowingOwner(bot);
+        }
+    }
+
+private:
+    static void ResumeFollowingOwner(Player* bot)
+    {
+        PlayerbotAI* botAI = GET_PLAYERBOT_AI(bot);
+        if (!botAI || !botAI->GetMaster())
+            return;
+
+        LOG_INFO("playerbots", "Cluster: alt bot {} freed from group, following {} again",
+                 bot->GetName(), botAI->GetMaster()->GetName());
+
+        botAI->ResetStrategies();
+        botAI->ChangeStrategy("+follow", BOT_STATE_NON_COMBAT);
+        botAI->Reset();
     }
 };
 
