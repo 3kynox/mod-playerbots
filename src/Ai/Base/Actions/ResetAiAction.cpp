@@ -61,6 +61,6 @@ bool ResetAiAction::Execute(Event event)
     }
     PlayerbotRepository::instance().Reset(botAI);
     botAI->ResetStrategies(false);
-    botAI->TellMaster("AI was reset to defaults");
+    botAI->TellMaster("*shakes head* All clear! Ready for adventure.");
     return true;
 }
