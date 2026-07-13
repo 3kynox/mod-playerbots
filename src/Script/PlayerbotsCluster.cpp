@@ -371,11 +371,18 @@ public:
         // The removed member is one of our local alt bots (owner uninvite or
         // our own GroupLeave below): resume following its owner.
         if (Player* bot = ObjectAccessor::FindPlayer(guid))
+        {
             if (bot->GetSession() && bot->GetSession()->IsBot() && !sRandomPlayerbotMgr.IsRandomBot(bot))
             {
                 ResumeFollowingOwner(bot);
                 return;
             }
+        }
+        else
+            // BUG-030: one alt missed its release with no trace; log the only
+            // path where the removed member itself is unreachable.
+            LOG_INFO("playerbots", "Cluster: removed member {} of group {} not found locally",
+                     guid.GetCounter(), group->GetGUID().GetCounter());
 
         std::vector<uint64> altsToLeave;
         for (Group::MemberSlot const& slot : group->GetMemberSlots())
@@ -432,8 +439,22 @@ private:
     static void ResumeFollowingOwner(Player* bot)
     {
         PlayerbotAI* botAI = GET_PLAYERBOT_AI(bot);
-        if (!botAI || !botAI->GetMaster())
+        if (!botAI)
+        {
+            LOG_WARN("playerbots", "Cluster: alt bot {} freed from group but has no AI", bot->GetName());
             return;
+        }
+
+        if (!botAI->GetMaster())
+        {
+            // BUG-030: without this the alt stays stuck in group strategies.
+            // Reset anyway; the next invite rebinds the follow.
+            LOG_WARN("playerbots", "Cluster: alt bot {} freed from group but has no master, resetting strategies only",
+                     bot->GetName());
+            botAI->ResetStrategies();
+            botAI->Reset();
+            return;
+        }
 
         LOG_INFO("playerbots", "Cluster: alt bot {} freed from group, following {} again",
                  bot->GetName(), botAI->GetMaster()->GetName());
