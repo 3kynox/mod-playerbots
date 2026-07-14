@@ -34,6 +34,7 @@
 #include "ScriptMgr.h"
 #include "TC9Sidecar.h"
 #include "WorldSession.h"
+#include "WorldSessionMgr.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -447,8 +448,26 @@ private:
 
         if (!botAI->GetMaster())
         {
-            // BUG-030: without this the alt stays stuck in group strategies.
-            // Reset anyway; the next invite rebinds the follow.
+            // BUG-030: the master pointer can be transiently null when the
+            // removal lands; rebind it through the owner's real session
+            // (alt bots share the owner's account, bot sessions are not in
+            // the session map so this always yields the real player).
+            if (WorldSession* ownerSession = sWorldSessionMgr->FindSession(bot->GetSession()->GetAccountId()))
+            {
+                Player* owner = ownerSession->GetPlayer();
+                if (owner && owner->IsInWorld())
+                {
+                    LOG_INFO("playerbots", "Cluster: alt bot {} freed from group with no master, rebinding to {}",
+                             bot->GetName(), owner->GetName());
+                    botAI->SetMaster(owner);
+                }
+            }
+        }
+
+        if (!botAI->GetMaster())
+        {
+            // Owner unreachable on this shard: reset anyway, the next
+            // invite rebinds the follow.
             LOG_WARN("playerbots", "Cluster: alt bot {} freed from group but has no master, resetting strategies only",
                      bot->GetName());
             botAI->ResetStrategies();
