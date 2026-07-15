@@ -47,6 +47,7 @@ namespace
 {
     constexpr char CLUSTER_LOGIN_REQUEST_SUBJECT[] = "playerbots.login-request";
     constexpr char GROUP_INVITE_CREATED_SUBJECT[] = "group.invite.created";
+    constexpr char GUILD_INVITE_CREATED_SUBJECT[] = "guild.invite.created";
     constexpr uint32 CLUSTER_KICK_COOLDOWN_MS = 30 * 1000;  // per bot, breaks kick<->handoff loops
     constexpr uint32 CLUSTER_LOGIN_DELAY_MS = 2 * 1000;     // lets the sender's logout save reach the DB
 
@@ -147,6 +148,61 @@ namespace
             sToCloud9Sidecar->GroupAcceptInvite(guidCounter);
         }).detach();
     }
+
+    // Runs on the world thread (delivered through ProcessHooks). The guild
+    // service created an invite for a character without gateway session; if
+    // that character is one of our local random bots, accept on its behalf.
+    // Mirror of OnClusterGroupInviteCreated (SMSG_GUILD_INVITE only reaches
+    // gateway sessions, so the vanilla "guild invite"->"guild accept" trigger
+    // never fires for in-process bots).
+    void OnClusterGuildInviteCreated(char const* /*subject*/, char const* payload, int payloadLen)
+    {
+        if (!sPlayerbotAIConfig.enabled)
+            return;
+
+        std::string data(payload, payloadLen);
+        uint64 inviteeGUID = 0;
+        if (!ExtractJsonUInt64(data, "InviteeGUID", inviteeGUID) || !inviteeGUID)
+            return;
+
+        Player* bot = ObjectAccessor::FindPlayer(
+            ObjectGuid::Create<HighGuid::Player>(ObjectGuid::LowType(inviteeGUID)));
+        if (!bot || !bot->GetSession() || !bot->GetSession()->IsBot())
+            return;  // not one of our in-process sessions (real players use the gateway)
+
+        if (!sRandomPlayerbotMgr.IsRandomBot(bot))
+        {
+            // Alt bots: only their owner may pull them into a guild (cluster
+            // stand-in for the security check; the inviter can be cross-shard,
+            // so compare GUIDs instead of resolving a local Player).
+            PlayerbotAI* botAI = GET_PLAYERBOT_AI(bot);
+            uint64 inviterGUID = 0;
+            if (!botAI || !botAI->GetMaster() ||
+                !ExtractJsonUInt64(data, "InviterGUID", inviterGUID) ||
+                botAI->GetMaster()->GetGUID().GetCounter() != ObjectGuid::LowType(inviterGUID))
+                return;
+        }
+
+        if (bot->GetGuildId())
+            return;  // already in a guild (local mirror fed by guild.* events)
+
+        LOG_INFO("playerbots", "Cluster: accepting guild invite for bot {}", bot->GetName());
+
+        // Snapshot the bot's character on the world thread; the guild service's
+        // InviteAccepted RPC needs the full member row. Blocking gRPC call runs
+        // off-thread; the guild membership comes back via guild.member.added.
+        uint64 guidCounter = bot->GetGUID().GetCounter();
+        std::string name = bot->GetName();
+        uint32 lvl = bot->GetLevel();
+        uint32 race = bot->getRace();
+        uint32 classId = bot->getClass();
+        uint32 gender = bot->getGender();
+        uint32 areaId = bot->GetZoneId();
+        uint64 accountId = bot->GetSession()->GetAccountId();
+        std::thread([=]() {
+            sToCloud9Sidecar->GuildAcceptInvite(guidCounter, name, lvl, race, classId, gender, areaId, accountId);
+        }).detach();
+    }
 }
 
 namespace PlayerbotsCluster
@@ -211,7 +267,8 @@ public:
         if (!clusterSubscribed && sPlayerbotAIConfig.enabled)
             clusterSubscribed =
                 sToCloud9Sidecar->NatsSubscribe(CLUSTER_LOGIN_REQUEST_SUBJECT, &OnClusterLoginRequest) &&
-                sToCloud9Sidecar->NatsSubscribe(GROUP_INVITE_CREATED_SUBJECT, &OnClusterGroupInviteCreated);
+                sToCloud9Sidecar->NatsSubscribe(GROUP_INVITE_CREATED_SUBJECT, &OnClusterGroupInviteCreated) &&
+                sToCloud9Sidecar->NatsSubscribe(GUILD_INVITE_CREATED_SUBJECT, &OnClusterGuildInviteCreated);
 
         UpdateCooldowns(diff);
         ProcessPendingKicks();
