@@ -8,6 +8,7 @@
 #include "ArenaTeam.h"
 #include "Event.h"
 #include "Playerbots.h"
+#include "RandomPlayerbotMgr.h"
 
 bool PetitionSignAction::Execute(Event event)
 {
@@ -72,6 +73,14 @@ bool PetitionSignAction::Execute(Event event)
 
     if (_inviter == bot)
         return false;
+
+    // Alt bots only sign charters offered by their own master (mirror of the
+    // guild/group invite gating): decline other players' petitions.
+    if (!sRandomPlayerbotMgr.IsRandomBot(bot) && botAI->GetMaster() != _inviter)
+    {
+        botAI->TellError("Sorry, I only sign my master's petitions");
+        accept = false;
+    }
 
     if (!accept || !botAI->GetSecurity()->CheckLevelFor(PLAYERBOT_SECURITY_INVITE, false, _inviter, true))
     {
