@@ -23,6 +23,7 @@
 // no playerbots-enabled worldserver serves the destination
 // (AiPlayerbot.ClusterBotMaps).
 
+#include "BattlegroundMgr.h"
 #include "Log.h"
 #include "ObjectAccessor.h"
 #include "ObjectGuid.h"
@@ -30,6 +31,8 @@
 #include "PlayerbotAIConfig.h"
 #include "Playerbots.h"
 #include "PlayerbotsCluster.h"
+#include "PositionValue.h"
+#include "Random.h"
 #include "RandomPlayerbotMgr.h"
 #include "ScriptMgr.h"
 #include "TC9Sidecar.h"
@@ -49,8 +52,11 @@ namespace
     constexpr char GROUP_INVITE_CREATED_SUBJECT[] = "group.invite.created";
     constexpr char GUILD_INVITE_CREATED_SUBJECT[] = "guild.invite.created";
     constexpr char GROUP_MESSAGE_NEW_SUBJECT[] = "group.message.new";
+    constexpr char MATCHMAKING_INVITED_SUBJECT[] = "matchmaking.pvpqueue.invited";
     constexpr uint32 CLUSTER_KICK_COOLDOWN_MS = 30 * 1000;  // per bot, breaks kick<->handoff loops
     constexpr uint32 CLUSTER_LOGIN_DELAY_MS = 2 * 1000;     // lets the sender's logout save reach the DB
+    constexpr int32 CLUSTER_BG_JOIN_RETRY_MS = 500;         // local BG instance can lag behind the invite
+    constexpr int32 CLUSTER_BG_JOIN_ATTEMPTS = 20;
 
     // Fed from map-update worker threads, drained on the world thread.
     std::mutex clusterPendingMutex;
@@ -66,6 +72,18 @@ namespace
     };
     std::vector<ClusterPendingLogin> clusterPendingLogins;
     bool clusterSubscribed = false;
+
+    // Fed from the sidecar-query threads, drained on the world thread.
+    struct ClusterPendingBGJoin
+    {
+        ObjectGuid::LowType guid;
+        uint32 bgTypeId;
+        uint32 instanceId;
+        int32 attemptsLeft;
+        int32 delay;
+    };
+    std::mutex clusterPendingBGMutex;
+    std::vector<ClusterPendingBGJoin> clusterPendingBGJoins;
 
     bool IsMapServedByClusterBots(uint32 mapId)
     {
@@ -315,6 +333,65 @@ namespace
                 botAI->HandleCommand(uint32(messageType), msg, sender);
         }
     }
+
+    // Runs on the world thread (delivered through ProcessHooks). The
+    // matchmaking service invited players to a battleground; an in-process
+    // bot has no gateway session, so nobody accepts the invite nor performs
+    // the enterBattleground sequence (queue data -> AddPlayers -> joined
+    // confirmation) on its behalf (chantier C-BG, DESIGN-bots-bg-cluster.md).
+    void OnClusterBGInvite(char const* /*subject*/, char const* payload, int payloadLen)
+    {
+        if (!sPlayerbotAIConfig.enabled)
+            return;
+
+        std::string data(payload, payloadLen);
+        std::vector<uint64> invited;
+        if (!ExtractJsonUInt64Array(data, "PlayersGUID", invited))
+            return;
+
+        for (uint64 guidRaw : invited)
+        {
+            Player* bot = ObjectAccessor::FindPlayer(
+                ObjectGuid::Create<HighGuid::Player>(ObjectGuid::LowType(guidRaw)));
+            if (!bot || !bot->GetSession() || !bot->GetSession()->IsBot())
+                continue;
+
+            if (sRandomPlayerbotMgr.IsRandomBot(bot))
+                continue;  // only alts queued with their master; random bots keep RandomBotJoinBG=0
+
+            LOG_INFO("playerbots", "Cluster: bot {} invited to BG, querying assignment", bot->GetName());
+
+            // Blocking gRPC calls: keep them off the world thread. The join
+            // itself needs the world thread, so it comes back through
+            // clusterPendingBGJoins.
+            uint64 guidCounter = bot->GetGUID().GetCounter();
+            std::thread([guidCounter]() {
+                uint32 bgTypeId = 0;
+                uint32 instanceId = 0;
+                uint32 mapId = 0;
+                bool isLocal = false;
+                if (!sToCloud9Sidecar->BattlegroundQueueDataForLocalPlayer(
+                        guidCounter, bgTypeId, instanceId, mapId, isLocal))
+                {
+                    LOG_INFO("playerbots", "Cluster: no BG assignment for invited bot guid {}", guidCounter);
+                    return;
+                }
+
+                if (!isLocal)
+                {
+                    // C-BG.2 (cross-shard: pending BG in the login-request)
+                    // not implemented: let the invite expire.
+                    LOG_INFO("playerbots", "Cluster: bot guid {} BG instance {} runs on another shard, skipping",
+                             guidCounter, instanceId);
+                    return;
+                }
+
+                std::lock_guard<std::mutex> lock(clusterPendingBGMutex);
+                clusterPendingBGJoins.push_back({ObjectGuid::LowType(guidCounter), bgTypeId, instanceId,
+                                                 CLUSTER_BG_JOIN_ATTEMPTS, CLUSTER_BG_JOIN_RETRY_MS});
+            }).detach();
+        }
+    }
 }
 
 namespace PlayerbotsCluster
@@ -381,11 +458,13 @@ public:
                 sToCloud9Sidecar->NatsSubscribe(CLUSTER_LOGIN_REQUEST_SUBJECT, &OnClusterLoginRequest) &&
                 sToCloud9Sidecar->NatsSubscribe(GROUP_INVITE_CREATED_SUBJECT, &OnClusterGroupInviteCreated) &&
                 sToCloud9Sidecar->NatsSubscribe(GUILD_INVITE_CREATED_SUBJECT, &OnClusterGuildInviteCreated) &&
-                sToCloud9Sidecar->NatsSubscribe(GROUP_MESSAGE_NEW_SUBJECT, &OnClusterGroupChatMessage);
+                sToCloud9Sidecar->NatsSubscribe(GROUP_MESSAGE_NEW_SUBJECT, &OnClusterGroupChatMessage) &&
+                sToCloud9Sidecar->NatsSubscribe(MATCHMAKING_INVITED_SUBJECT, &OnClusterBGInvite);
 
         UpdateCooldowns(diff);
         ProcessPendingKicks();
         ProcessPendingLogins(diff);
+        ProcessPendingBGJoins(diff);
     }
 
 private:
@@ -451,6 +530,93 @@ private:
                 // executed on arrival with the destination map.)
                 bot->SaveToDB(false, false);
             }
+        }
+    }
+
+    // World thread. Replicates the gateway's enterBattleground tail for an
+    // in-process bot whose BG runs on THIS shard: AddPlayersToBattleground
+    // equivalent (entry point + bg id + teleport) then joined confirmation,
+    // plus the playerbots force-join state (BattleGroundJoinAction mirror).
+    void ProcessPendingBGJoins(uint32 diff)
+    {
+        std::vector<ClusterPendingBGJoin> joins;
+        {
+            std::lock_guard<std::mutex> lock(clusterPendingBGMutex);
+            if (clusterPendingBGJoins.empty())
+                return;
+            joins.swap(clusterPendingBGJoins);
+        }
+
+        std::vector<ClusterPendingBGJoin> keep;
+        for (ClusterPendingBGJoin& join : joins)
+        {
+            join.delay -= int32(diff);
+            if (join.delay > 0)
+            {
+                keep.push_back(join);
+                continue;
+            }
+
+            Player* bot = ObjectAccessor::FindPlayer(ObjectGuid::Create<HighGuid::Player>(join.guid));
+            if (!bot || !bot->GetSession() || !bot->GetSession()->IsBot() || bot->InBattleground())
+                continue;
+
+            Battleground* bg = sBattlegroundMgr->GetBattleground(join.instanceId, BATTLEGROUND_TYPE_NONE);
+            if (!bg)
+            {
+                // The local instance is created by the matchmaking's
+                // StartBattleground call, which can land after the invite.
+                if (--join.attemptsLeft > 0)
+                {
+                    join.delay = CLUSTER_BG_JOIN_RETRY_MS;
+                    keep.push_back(join);
+                }
+                else
+                    LOG_WARN("playerbots", "Cluster: BG instance {} never appeared locally, bot {} stays out",
+                             join.instanceId, bot->GetName());
+                continue;
+            }
+
+            BattlegroundTypeId bgTypeId = BattlegroundTypeId(join.bgTypeId);
+
+            LOG_INFO("playerbots", "Cluster: bot {} force-joins BG type {} instance {}",
+                     bot->GetName(), join.bgTypeId, join.instanceId);
+
+            bot->SetEntryPoint();
+            bot->SetBattlegroundId(bg->GetInstanceID(), bg->GetBgTypeID(), 1, true,
+                                   bgTypeId == BATTLEGROUND_RB, bot->GetTeamId(true));
+            sBattlegroundMgr->SendToBattleground(bot, bg->GetInstanceID(), bgTypeId);
+
+            if (PlayerbotAI* botAI = GET_PLAYERBOT_AI(bot))
+            {
+                WorldPacket emptyPacket;
+                bot->GetSession()->HandleCancelMountAuraOpcode(emptyPacket);
+
+                botAI->ResetStrategies(false);
+                if (!bot->GetBattleground())
+                    botAI->ChangeStrategy("+bg", BOT_STATE_NON_COMBAT);
+
+                AiObjectContext* context = botAI->GetAiObjectContext();
+                context->GetValue<uint32>("bg role")->Set(urand(0, 9));
+                PositionMap& posMap = context->GetValue<PositionMap&>("position")->Get();
+                PositionInfo pos = posMap["bg objective"];
+                pos.Reset();
+                posMap["bg objective"] = pos;
+            }
+
+            // Blocking gRPC call: keep it off the world thread.
+            uint64 guidCounter = join.guid;
+            uint32 instanceId = join.instanceId;
+            std::thread([guidCounter, instanceId]() {
+                if (!sToCloud9Sidecar->NotifyPlayerJoinedBattleground(guidCounter, instanceId))
+                    LOG_WARN("playerbots", "Cluster: PlayerJoinedBattleground failed for bot guid {}", guidCounter);
+            }).detach();
+        }
+
+        if (!keep.empty())
+        {
+            std::lock_guard<std::mutex> lock(clusterPendingBGMutex);
+            clusterPendingBGJoins.insert(clusterPendingBGJoins.end(), keep.begin(), keep.end());
         }
     }
 
