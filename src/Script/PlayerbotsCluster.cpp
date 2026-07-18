@@ -48,6 +48,7 @@ namespace
     constexpr char CLUSTER_LOGIN_REQUEST_SUBJECT[] = "playerbots.login-request";
     constexpr char GROUP_INVITE_CREATED_SUBJECT[] = "group.invite.created";
     constexpr char GUILD_INVITE_CREATED_SUBJECT[] = "guild.invite.created";
+    constexpr char GROUP_MESSAGE_NEW_SUBJECT[] = "group.message.new";
     constexpr uint32 CLUSTER_KICK_COOLDOWN_MS = 30 * 1000;  // per bot, breaks kick<->handoff loops
     constexpr uint32 CLUSTER_LOGIN_DELAY_MS = 2 * 1000;     // lets the sender's logout save reach the DB
 
@@ -101,6 +102,67 @@ namespace
             return false;
 
         return sscanf(json.c_str() + pos + needle.size(), "%llu", (unsigned long long*)&out) == 1;
+    }
+
+    // String variant. Handles the escapes Go's json.Marshal emits inside chat
+    // text; exotic escapes (\uXXXX) are kept raw — chat commands are plain
+    // words, anything else was never a command to begin with.
+    bool ExtractJsonString(std::string const& json, char const* key, std::string& out)
+    {
+        std::string needle = std::string("\"") + key + "\":\"";
+        size_t pos = json.find(needle);
+        if (pos == std::string::npos)
+            return false;
+
+        out.clear();
+        for (size_t i = pos + needle.size(); i < json.size(); ++i)
+        {
+            char c = json[i];
+            if (c == '"')
+                return true;
+
+            if (c == '\\' && i + 1 < json.size())
+            {
+                char next = json[++i];
+                if (next == '"' || next == '\\' || next == '/')
+                    out += next;
+                else
+                {
+                    out += '\\';
+                    out += next;
+                }
+                continue;
+            }
+
+            out += c;
+        }
+
+        return false;  // unterminated string
+    }
+
+    // Array-of-numbers variant ("Receivers":[1,2,...]).
+    bool ExtractJsonUInt64Array(std::string const& json, char const* key, std::vector<uint64>& out)
+    {
+        std::string needle = std::string("\"") + key + "\":[";
+        size_t pos = json.find(needle);
+        if (pos == std::string::npos)
+            return false;
+
+        char const* cursor = json.c_str() + pos + needle.size();
+        while (*cursor && *cursor != ']')
+        {
+            unsigned long long value = 0;
+            int consumed = 0;
+            if (sscanf(cursor, "%llu%n", &value, &consumed) != 1)
+                return false;
+
+            out.push_back(uint64(value));
+            cursor += consumed;
+            if (*cursor == ',')
+                ++cursor;
+        }
+
+        return *cursor == ']';
     }
 
     // Runs on the world thread (delivered through ProcessHooks). The group
@@ -203,6 +265,56 @@ namespace
             sToCloud9Sidecar->GuildAcceptInvite(guidCounter, name, lvl, race, classId, gender, areaId, accountId);
         }).detach();
     }
+
+    // Runs on the world thread (delivered through ProcessHooks). Behind the
+    // gateway, group/raid chat is served by the group service: the sender's
+    // CMSG_MESSAGECHAT never reaches this worldserver, so the vanilla
+    // OnPlayerCanUseChat(Group*) hook — the entry point for every chat
+    // command (follow, stay, summon...) — never fires for in-process bots.
+    // Feed the receivers that are local bots from the NATS mirror instead.
+    void OnClusterGroupChatMessage(char const* /*subject*/, char const* payload, int payloadLen)
+    {
+        if (!sPlayerbotAIConfig.enabled)
+            return;
+
+        std::string data(payload, payloadLen);
+        uint64 senderGUID = 0;
+        if (!ExtractJsonUInt64(data, "SenderGUID", senderGUID) || !senderGUID)
+            return;
+
+        // HandleCommand needs the sender as a local Player. Alt bots live on
+        // their owner's shard so the interesting sender always resolves; a
+        // cross-shard sender has no local Player to command through.
+        Player* sender = ObjectAccessor::FindPlayer(
+            ObjectGuid::Create<HighGuid::Player>(ObjectGuid::LowType(senderGUID)));
+        if (!sender)
+            return;
+
+        if (sender->GetSession() && sender->GetSession()->IsBot())
+            return;  // bot chatter already goes through the vanilla local hook
+
+        uint64 messageType = 0;
+        std::string msg;
+        std::vector<uint64> receivers;
+        if (!ExtractJsonUInt64(data, "MessageType", messageType) ||
+            !ExtractJsonString(data, "Msg", msg) || msg.empty() ||
+            !ExtractJsonUInt64Array(data, "Receivers", receivers))
+            return;
+
+        for (uint64 guid : receivers)
+        {
+            if (guid == senderGUID)
+                continue;
+
+            Player* member = ObjectAccessor::FindPlayer(
+                ObjectGuid::Create<HighGuid::Player>(ObjectGuid::LowType(guid)));
+            if (!member || !member->GetSession() || !member->GetSession()->IsBot())
+                continue;
+
+            if (PlayerbotAI* botAI = GET_PLAYERBOT_AI(member))
+                botAI->HandleCommand(uint32(messageType), msg, sender);
+        }
+    }
 }
 
 namespace PlayerbotsCluster
@@ -268,7 +380,8 @@ public:
             clusterSubscribed =
                 sToCloud9Sidecar->NatsSubscribe(CLUSTER_LOGIN_REQUEST_SUBJECT, &OnClusterLoginRequest) &&
                 sToCloud9Sidecar->NatsSubscribe(GROUP_INVITE_CREATED_SUBJECT, &OnClusterGroupInviteCreated) &&
-                sToCloud9Sidecar->NatsSubscribe(GUILD_INVITE_CREATED_SUBJECT, &OnClusterGuildInviteCreated);
+                sToCloud9Sidecar->NatsSubscribe(GUILD_INVITE_CREATED_SUBJECT, &OnClusterGuildInviteCreated) &&
+                sToCloud9Sidecar->NatsSubscribe(GROUP_MESSAGE_NEW_SUBJECT, &OnClusterGroupChatMessage);
 
         UpdateCooldowns(diff);
         ProcessPendingKicks();
