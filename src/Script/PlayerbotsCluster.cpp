@@ -27,6 +27,7 @@
 #include "Log.h"
 #include "ObjectAccessor.h"
 #include "ObjectGuid.h"
+#include "Opcodes.h"
 #include "Player.h"
 #include "PlayerbotAIConfig.h"
 #include "Playerbots.h"
@@ -53,10 +54,15 @@ namespace
     constexpr char GUILD_INVITE_CREATED_SUBJECT[] = "guild.invite.created";
     constexpr char GROUP_MESSAGE_NEW_SUBJECT[] = "group.message.new";
     constexpr char MATCHMAKING_INVITED_SUBJECT[] = "matchmaking.pvpqueue.invited";
+    constexpr char MATCHMAKING_QUEUED_SUBJECT[] = "matchmaking.pvpqueue.joined";
+    constexpr char MATCHMAKING_EXPIRED_SUBJECT[] = "matchmaking.pvpqueue.invite.expired";
     constexpr uint32 CLUSTER_KICK_COOLDOWN_MS = 30 * 1000;  // per bot, breaks kick<->handoff loops
     constexpr uint32 CLUSTER_LOGIN_DELAY_MS = 2 * 1000;     // lets the sender's logout save reach the DB
     constexpr int32 CLUSTER_BG_JOIN_RETRY_MS = 500;         // local BG instance can lag behind the invite
     constexpr int32 CLUSTER_BG_JOIN_ATTEMPTS = 20;
+    // Safety net only: matchmaking owns the queue timers, the map is cleared
+    // on invite/expire events; the TTL just unblocks bots after lost events.
+    constexpr int32 CLUSTER_BG_QUEUE_TTL_MS = 10 * 60 * 1000;
 
     // Fed from map-update worker threads, drained on the world thread.
     std::mutex clusterPendingMutex;
@@ -84,6 +90,10 @@ namespace
     };
     std::mutex clusterPendingBGMutex;
     std::vector<ClusterPendingBGJoin> clusterPendingBGJoins;
+
+    // World thread only. Random bots we enqueued into the matchmaking BG
+    // queues (C-BG.3), keyed by guid; value = remaining safety TTL.
+    std::unordered_map<ObjectGuid::LowType, int32> clusterBGQueuedBots;
 
     bool IsMapServedByClusterBots(uint32 mapId)
     {
@@ -356,8 +366,10 @@ namespace
             if (!bot || !bot->GetSession() || !bot->GetSession()->IsBot())
                 continue;
 
-            if (sRandomPlayerbotMgr.IsRandomBot(bot))
-                continue;  // only alts queued with their master; random bots keep RandomBotJoinBG=0
+            clusterBGQueuedBots.erase(bot->GetGUID().GetCounter());
+
+            if (sRandomPlayerbotMgr.IsRandomBot(bot) && !sPlayerbotAIConfig.randomBotJoinBG)
+                continue;  // random bots opt into BG queues through RandomBotJoinBG (C-BG.3)
 
             LOG_INFO("playerbots", "Cluster: bot {} invited to BG, querying assignment", bot->GetName());
 
@@ -391,6 +403,124 @@ namespace
                                                  CLUSTER_BG_JOIN_ATTEMPTS, CLUSTER_BG_JOIN_RETRY_MS});
             }).detach();
         }
+    }
+
+    // Runs on the world thread (delivered through ProcessHooks). A player
+    // entered a matchmaking BG queue; in vanilla RandomBotJoinBG makes random
+    // bots fill both factions so the battleground pops, but the vanilla
+    // detection reads the LOCAL AC queue, empty behind the gateway. Fill the
+    // matchmaking queue instead, from the shard hosting the battleground map
+    // (the only one whose bots can force-join at the pop, see C-BG.1 above).
+    void OnClusterBGQueueJoined(char const* /*subject*/, char const* payload, int payloadLen)
+    {
+        if (!sPlayerbotAIConfig.enabled || !sPlayerbotAIConfig.randomBotJoinBG)
+            return;
+
+        std::string data(payload, payloadLen);
+
+        uint64 arenaType = 0;
+        if (ExtractJsonUInt64(data, "ArenaType", arenaType) && arenaType)
+            return;  // arenas are out of scope
+
+        uint64 typeId = 0;
+        uint64 minLvl = 0;
+        uint64 maxLvl = 0;
+        std::vector<uint64> queued;
+        if (!ExtractJsonUInt64(data, "TypeID", typeId) ||
+            !ExtractJsonUInt64(data, "PVPQueueMinLVL", minLvl) ||
+            !ExtractJsonUInt64(data, "PVPQueueMaxLVL", maxLvl) ||
+            !ExtractJsonUInt64Array(data, "PlayersGUID", queued) || queued.empty())
+            return;
+
+        // Our own fills echo back through this event: an enqueue whose
+        // players are local bots must not trigger another fill.
+        for (uint64 guidRaw : queued)
+        {
+            Player* who = ObjectAccessor::FindPlayer(
+                ObjectGuid::Create<HighGuid::Player>(ObjectGuid::LowType(guidRaw)));
+            if (who && who->GetSession() && who->GetSession()->IsBot())
+                return;
+        }
+
+        Battleground* bgTemplate = sBattlegroundMgr->GetBattlegroundTemplate(BattlegroundTypeId(typeId));
+        if (!bgTemplate || !sToCloud9Sidecar->IsMapAssigned(bgTemplate->GetMapId()))
+            return;
+
+        uint32 perFaction = std::max<uint32>(1, bgTemplate->GetMinPlayersPerTeam());
+
+        struct BGFillPick
+        {
+            ObjectGuid::LowType guid;
+            uint32 level;
+            uint32 pvpTeamId;  // matchmaking enum: 1 alliance, 2 horde
+        };
+        uint32 needed[2] = {perFaction, perFaction};  // TEAM_ALLIANCE, TEAM_HORDE
+        std::vector<BGFillPick> picks;
+
+        for (auto it = sRandomPlayerbotMgr.GetPlayerBotsBegin();
+             it != sRandomPlayerbotMgr.GetPlayerBotsEnd(); ++it)
+        {
+            Player* bot = it->second;
+            if (!bot || !bot->IsInWorld() || !bot->GetSession() || !bot->GetSession()->IsBot() ||
+                !sRandomPlayerbotMgr.IsRandomBot(bot))
+                continue;
+
+            if (bot->GetGroup() || bot->InBattleground() || bot->InBattlegroundQueue() || !bot->IsAlive())
+                continue;
+
+            uint32 level = bot->GetLevel();
+            if (level < minLvl || level > maxLvl)
+                continue;
+
+            if (clusterBGQueuedBots.count(bot->GetGUID().GetCounter()))
+                continue;  // already sitting in a matchmaking queue
+
+            TeamId team = bot->GetTeamId();
+            if (team > TEAM_HORDE || !needed[team])
+                continue;
+
+            --needed[team];
+            picks.push_back({bot->GetGUID().GetCounter(), level, team == TEAM_HORDE ? 2u : 1u});
+            if (!needed[TEAM_ALLIANCE] && !needed[TEAM_HORDE])
+                break;
+        }
+
+        if (picks.empty())
+            return;
+
+        for (BGFillPick const& pick : picks)
+            clusterBGQueuedBots[pick.guid] = CLUSTER_BG_QUEUE_TTL_MS;
+
+        LOG_INFO("playerbots",
+                 "Cluster: filling BG type {} bracket {}-{} queue with {} bots ({} alliance / {} horde still short)",
+                 typeId, minLvl, maxLvl, picks.size(), needed[TEAM_ALLIANCE], needed[TEAM_HORDE]);
+
+        // Blocking gRPC calls: keep them off the world thread, sequential to
+        // spare the matchmaking service.
+        uint32 bgTypeId = uint32(typeId);
+        std::thread([picks, bgTypeId]() {
+            for (BGFillPick const& pick : picks)
+                if (!sToCloud9Sidecar->EnqueueLocalPlayerToBattleground(
+                        pick.guid, pick.level, bgTypeId, pick.pvpTeamId))
+                    LOG_WARN("playerbots", "Cluster: BG enqueue failed for bot guid {}", pick.guid);
+        }).detach();
+    }
+
+    // Runs on the world thread (delivered through ProcessHooks). Invited
+    // players who never joined got dropped from the queue: free the bots so
+    // a later enqueue can pick them again.
+    void OnClusterBGInviteExpired(char const* /*subject*/, char const* payload, int payloadLen)
+    {
+        if (!sPlayerbotAIConfig.enabled)
+            return;
+
+        std::string data(payload, payloadLen);
+        std::vector<uint64> expired;
+        if (!ExtractJsonUInt64Array(data, "PlayersGUID", expired))
+            return;
+
+        for (uint64 guidRaw : expired)
+            clusterBGQueuedBots.erase(ObjectGuid::LowType(guidRaw));
     }
 }
 
@@ -459,7 +589,9 @@ public:
                 sToCloud9Sidecar->NatsSubscribe(GROUP_INVITE_CREATED_SUBJECT, &OnClusterGroupInviteCreated) &&
                 sToCloud9Sidecar->NatsSubscribe(GUILD_INVITE_CREATED_SUBJECT, &OnClusterGuildInviteCreated) &&
                 sToCloud9Sidecar->NatsSubscribe(GROUP_MESSAGE_NEW_SUBJECT, &OnClusterGroupChatMessage) &&
-                sToCloud9Sidecar->NatsSubscribe(MATCHMAKING_INVITED_SUBJECT, &OnClusterBGInvite);
+                sToCloud9Sidecar->NatsSubscribe(MATCHMAKING_INVITED_SUBJECT, &OnClusterBGInvite) &&
+                sToCloud9Sidecar->NatsSubscribe(MATCHMAKING_QUEUED_SUBJECT, &OnClusterBGQueueJoined) &&
+                sToCloud9Sidecar->NatsSubscribe(MATCHMAKING_EXPIRED_SUBJECT, &OnClusterBGInviteExpired);
 
         UpdateCooldowns(diff);
         ProcessPendingKicks();
@@ -475,6 +607,15 @@ private:
             itr->second -= int32(diff);
             if (itr->second <= 0)
                 itr = clusterKickCooldowns.erase(itr);
+            else
+                ++itr;
+        }
+
+        for (auto itr = clusterBGQueuedBots.begin(); itr != clusterBGQueuedBots.end();)
+        {
+            itr->second -= int32(diff);
+            if (itr->second <= 0)
+                itr = clusterBGQueuedBots.erase(itr);
             else
                 ++itr;
         }
@@ -640,6 +781,68 @@ private:
 
             itr = clusterPendingLogins.erase(itr);
         }
+    }
+};
+
+// Chantier C-DJ: bots must walk into the instance behind their master, like
+// vanilla. The vanilla relay (PlayerbotMgr::HandleMasterIncomingPacket, fed
+// by PlayerbotsServerScript) forwards the master's CMSG_AREATRIGGER to every
+// random bot whose master POINTER matches — brittle in cluster, where the
+// master's Player object is recreated on every shard switch. Relay through
+// the local group mirror instead, skipping bots the vanilla loop already
+// covered so the packet is delivered exactly once.
+class PlayerbotsClusterServerScript : public ServerScript
+{
+public:
+    PlayerbotsClusterServerScript() : ServerScript("PlayerbotsClusterServerScript", {
+        SERVERHOOK_CAN_PACKET_RECEIVE
+    }) {}
+
+    void OnPacketReceived(WorldSession* session, WorldPacket const& packet) override
+    {
+        if (packet.GetOpcode() != CMSG_AREATRIGGER)
+            return;
+
+        if (!sPlayerbotAIConfig.enabled || !sToCloud9Sidecar->ClusterModeEnabled())
+            return;
+
+        Player* player = session->GetPlayer();
+        if (!player || session->IsBot())
+            return;
+
+        Group* group = player->GetGroup();
+        if (!group)
+            return;
+
+        bool masterMgrRelayed = GET_PLAYERBOT_MGR(player) != nullptr;
+        uint32 covered = 0;
+        uint32 relayed = 0;
+        for (Group::MemberSlot const& slot : group->GetMemberSlots())
+        {
+            if (slot.guid == player->GetGUID())
+                continue;
+
+            Player* member = ObjectAccessor::FindPlayer(slot.guid);
+            if (!member || !member->GetSession() || !member->GetSession()->IsBot())
+                continue;
+
+            PlayerbotAI* botAI = GET_PLAYERBOT_AI(member);
+            if (!botAI)
+                continue;
+
+            if (masterMgrRelayed && botAI->GetMaster() == player)
+            {
+                ++covered;  // vanilla relay already delivered this packet
+                continue;
+            }
+
+            botAI->HandleMasterIncomingPacket(packet);
+            ++relayed;
+        }
+
+        if (covered || relayed)
+            LOG_INFO("playerbots", "Cluster: area trigger from {}: {} bots on vanilla relay, {} relayed via group",
+                     player->GetName(), covered, relayed);
     }
 };
 
@@ -825,4 +1028,5 @@ void AddPlayerbotsClusterScripts()
     new PlayerbotsClusterPlayerScript();
     new PlayerbotsClusterWorldScript();
     new PlayerbotsClusterGroupScript();
+    new PlayerbotsClusterServerScript();
 }
