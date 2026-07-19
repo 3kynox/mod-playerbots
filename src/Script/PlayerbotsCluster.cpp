@@ -436,15 +436,23 @@ namespace
             !ExtractJsonUInt64Array(data, "PlayersGUID", queued) || queued.empty())
             return;
 
-        // Our own fills echo back through this event: an enqueue whose
-        // players are local bots must not trigger another fill.
+        // Our own fills echo back through this event: an enqueue where every
+        // player is a local bot must not trigger another fill. A human
+        // grouping with alt bots still counts as a real enqueue (skipping it
+        // left the opposite faction unfilled: observed as a 10v5 join).
+        bool allLocalBots = true;
         for (uint64 guidRaw : queued)
         {
             Player* who = ObjectAccessor::FindPlayer(
                 ObjectGuid::Create<HighGuid::Player>(ObjectGuid::LowType(guidRaw)));
-            if (who && who->GetSession() && who->GetSession()->IsBot())
-                return;
+            if (!who || !who->GetSession() || !who->GetSession()->IsBot())
+            {
+                allLocalBots = false;
+                break;
+            }
         }
+        if (allLocalBots)
+            return;
 
         Battleground* bgTemplate = sBattlegroundMgr->GetBattlegroundTemplate(BattlegroundTypeId(typeId));
         if (!bgTemplate || !sToCloud9Sidecar->IsMapAssigned(bgTemplate->GetMapId()))
