@@ -24,6 +24,7 @@
 // (AiPlayerbot.ClusterBotMaps).
 
 #include "BattlegroundMgr.h"
+#include "CharacterCache.h"
 #include "Log.h"
 #include "ObjectAccessor.h"
 #include "ObjectGuid.h"
@@ -87,6 +88,9 @@ namespace
         uint32 instanceId;
         int32 attemptsLeft;
         int32 delay;
+        // Backfill joins (C-BG.5) bypass the matchmaking queue: the service
+        // never invited the bot, so a joined confirmation would be rejected.
+        bool notifyMatchmaking = true;
     };
     std::mutex clusterPendingBGMutex;
     std::vector<ClusterPendingBGJoin> clusterPendingBGJoins;
@@ -455,6 +459,21 @@ namespace
             uint32 pvpTeamId;  // matchmaking enum: 1 alliance, 2 horde
         };
         uint32 needed[2] = {perFaction, perFaction};  // TEAM_ALLIANCE, TEAM_HORDE
+
+        // The queued humans hold slots on their own faction: don't double-book
+        // them with bots (a solo queuer used to produce 6v5).
+        for (uint64 guidRaw : queued)
+        {
+            CharacterCacheEntry const* entry = sCharacterCache->GetCharacterCacheByGuid(
+                ObjectGuid::Create<HighGuid::Player>(ObjectGuid::LowType(guidRaw)));
+            if (!entry)
+                continue;
+
+            TeamId team = Player::TeamIdForRace(entry->Race);
+            if (team <= TEAM_HORDE && needed[team])
+                --needed[team];
+        }
+
         std::vector<BGFillPick> picks;
 
         for (auto it = sRandomPlayerbotMgr.GetPlayerBotsBegin();
@@ -549,8 +568,35 @@ class PlayerbotsClusterPlayerScript : public PlayerScript
 {
 public:
     PlayerbotsClusterPlayerScript() : PlayerScript("PlayerbotsClusterPlayerScript", {
-        PLAYERHOOK_ON_UPDATE_ZONE
+        PLAYERHOOK_ON_UPDATE_ZONE,
+        PLAYERHOOK_ON_BEFORE_TELEPORT
     }) {}
+
+    // A random bot pulled out of a running battleground shrinks its team below
+    // MinPlayersPerTeam and AC ends the match "not enough players" (observed:
+    // bot silently teleported to its grind map mid-WSG). Veto the teleport and
+    // log the attempt so the trigger path becomes visible.
+    bool OnPlayerBeforeTeleport(Player* player, uint32 mapid, float /*x*/, float /*y*/, float /*z*/,
+                                float /*orientation*/, uint32 /*options*/, Unit* /*target*/) override
+    {
+        if (!sToCloud9Sidecar->ClusterModeEnabled())
+            return true;
+
+        if (!player->GetSession() || !player->GetSession()->IsBot() ||
+            !sRandomPlayerbotMgr.IsRandomBot(player))
+            return true;
+
+        Battleground* bg = player->GetBattleground();
+        if (!bg || mapid == bg->GetMapId())
+            return true;
+
+        if (bg->GetStatus() != STATUS_WAIT_JOIN && bg->GetStatus() != STATUS_IN_PROGRESS)
+            return true;
+
+        LOG_INFO("playerbots", "Cluster: blocked teleport of BG participant bot {} to map {} (bg instance {} status {})",
+                 player->GetName(), mapid, bg->GetInstanceID(), uint32(bg->GetStatus()));
+        return false;
+    }
 
     // May run on map-update worker threads: only collect, never act here.
     void OnPlayerUpdateZone(Player* player, uint32 /*newZone*/, uint32 /*newArea*/) override
@@ -644,6 +690,9 @@ private:
 
             if (!sRandomPlayerbotMgr.IsRandomBot(bot))
                 continue;  // alt bots follow their master, not the partition
+
+            if (bot->InBattleground())
+                continue;  // BG participants stay with their match (C-BG.5)
 
             clusterKickCooldowns[guid.GetCounter()] = int32(CLUSTER_KICK_COOLDOWN_MS);
 
@@ -745,13 +794,16 @@ private:
                 posMap["bg objective"] = pos;
             }
 
-            // Blocking gRPC call: keep it off the world thread.
-            uint64 guidCounter = join.guid;
-            uint32 instanceId = join.instanceId;
-            std::thread([guidCounter, instanceId]() {
-                if (!sToCloud9Sidecar->NotifyPlayerJoinedBattleground(guidCounter, instanceId))
-                    LOG_WARN("playerbots", "Cluster: PlayerJoinedBattleground failed for bot guid {}", guidCounter);
-            }).detach();
+            if (join.notifyMatchmaking)
+            {
+                // Blocking gRPC call: keep it off the world thread.
+                uint64 guidCounter = join.guid;
+                uint32 instanceId = join.instanceId;
+                std::thread([guidCounter, instanceId]() {
+                    if (!sToCloud9Sidecar->NotifyPlayerJoinedBattleground(guidCounter, instanceId))
+                        LOG_WARN("playerbots", "Cluster: PlayerJoinedBattleground failed for bot guid {}", guidCounter);
+                }).detach();
+            }
         }
 
         if (!keep.empty())
@@ -1023,10 +1075,91 @@ private:
     }
 };
 
+// Chantier C-BG.5: a participant leaving a running battleground (human quit,
+// bot yanked out) shrinks its team below MinPlayersPerTeam and AC schedules
+// the "not enough players" premature end. Refill the short team with local
+// random bots through the C-BG.1 force-join path (queue bypassed: the bots
+// join the running instance directly).
+class PlayerbotsClusterBGScript : public AllBattlegroundScript
+{
+public:
+    PlayerbotsClusterBGScript() : AllBattlegroundScript("PlayerbotsClusterBGScript", {
+        ALLBATTLEGROUNDHOOK_ON_BATTLEGROUND_REMOVE_PLAYER_AT_LEAVE
+    }) {}
+
+    void OnBattlegroundRemovePlayerAtLeave(Battleground* bg, Player* player) override
+    {
+        if (!sPlayerbotAIConfig.enabled || !sToCloud9Sidecar->ClusterModeEnabled())
+            return;
+
+        if (!bg || !bg->isBattleground() || bg->GetStatus() != STATUS_IN_PROGRESS)
+            return;
+
+        // The hook runs after the leaver's bg data reset: use the natural
+        // faction (no cross-faction battlegrounds on 3.3.5).
+        TeamId team = player->GetTeamId(true);
+        if (team > TEAM_HORDE)
+            return;
+
+        uint32 have = bg->GetPlayersCountByTeam(team);
+        uint32 minPerTeam = bg->GetMinPlayersPerTeam();
+        if (have >= minPerTeam)
+            return;
+
+        uint32 need = minPerTeam - have;
+        uint32 scheduled = 0;
+
+        std::lock_guard<std::mutex> lock(clusterPendingBGMutex);
+        for (auto it = sRandomPlayerbotMgr.GetPlayerBotsBegin();
+             need && it != sRandomPlayerbotMgr.GetPlayerBotsEnd(); ++it)
+        {
+            Player* bot = it->second;
+            if (!bot || !bot->IsInWorld() || !bot->GetSession() || !bot->GetSession()->IsBot() ||
+                !sRandomPlayerbotMgr.IsRandomBot(bot))
+                continue;
+
+            if (bot->GetGroup() || bot->InBattleground() || bot->InBattlegroundQueue() || !bot->IsAlive())
+                continue;
+
+            if (bot->GetTeamId() != team)
+                continue;
+
+            uint32 level = bot->GetLevel();
+            if (level < bg->GetMinLevel() || level > bg->GetMaxLevel())
+                continue;
+
+            ObjectGuid::LowType guidLow = bot->GetGUID().GetCounter();
+            if (clusterBGQueuedBots.count(guidLow))
+                continue;
+
+            bool alreadyPending = false;
+            for (ClusterPendingBGJoin const& pending : clusterPendingBGJoins)
+            {
+                if (pending.guid == guidLow)
+                {
+                    alreadyPending = true;
+                    break;
+                }
+            }
+            if (alreadyPending)
+                continue;
+
+            clusterPendingBGJoins.push_back({guidLow, uint32(bg->GetBgTypeID()), bg->GetInstanceID(),
+                                             CLUSTER_BG_JOIN_ATTEMPTS, 0, false});
+            --need;
+            ++scheduled;
+        }
+
+        LOG_INFO("playerbots", "Cluster: backfilling BG instance {} team {} with {} bots ({} still short)",
+                 bg->GetInstanceID(), uint32(team), scheduled, need);
+    }
+};
+
 void AddPlayerbotsClusterScripts()
 {
     new PlayerbotsClusterPlayerScript();
     new PlayerbotsClusterWorldScript();
     new PlayerbotsClusterGroupScript();
     new PlayerbotsClusterServerScript();
+    new PlayerbotsClusterBGScript();
 }
