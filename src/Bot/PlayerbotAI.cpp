@@ -269,6 +269,10 @@ void PlayerbotAI::UpdateAI(uint32 elapsed, bool minimal)
 
     CheckSelfBotMaintenance();
 
+    // If we get attacked, drop the pending delay so the engine can switch to combat.
+    if (nextAICheckDelay && bot->IsInCombat() && currentEngine != engines[BOT_STATE_COMBAT])
+        nextAICheckDelay = 0;
+
     if (!CanUpdateAI())
         return;
 
