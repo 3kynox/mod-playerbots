@@ -54,6 +54,13 @@ namespace
     constexpr char GROUP_INVITE_CREATED_SUBJECT[] = "group.invite.created";
     constexpr char GUILD_INVITE_CREATED_SUBJECT[] = "guild.invite.created";
     constexpr char GROUP_MESSAGE_NEW_SUBJECT[] = "group.message.new";
+    // The gateway swallows whisper and guild chat: it answers the chat service
+    // itself and never forwards the packet to the worldserver, so the vanilla
+    // OnPlayerCanUseChat hooks never fire and in-process bots stay deaf
+    // (BUG-TC9-057). These two subjects re-inject the message on the world side.
+    // The whisper subject is published per gateway, hence the wildcard token.
+    constexpr char WHISPER_INCOME_SUBJECT[] = "chat.gw.*.income.whisper";
+    constexpr char GUILD_MESSAGE_NEW_SUBJECT[] = "guild.message.new";
     constexpr char MATCHMAKING_INVITED_SUBJECT[] = "matchmaking.pvpqueue.invited";
     constexpr char MATCHMAKING_QUEUED_SUBJECT[] = "matchmaking.pvpqueue.joined";
     constexpr char MATCHMAKING_EXPIRED_SUBJECT[] = "matchmaking.pvpqueue.invite.expired";
@@ -345,6 +352,86 @@ namespace
 
             if (PlayerbotAI* botAI = GET_PLAYERBOT_AI(member))
                 botAI->HandleCommand(uint32(messageType), msg, sender);
+        }
+    }
+
+    // Whisper re-injection. Unlike the group hook we must NOT filter on
+    // session->IsBot(): a selfbot (".playerbot bot self") is a real player who
+    // happens to carry a PlayerbotAI, and it is the only channel it can be
+    // commanded through. The vanilla hook's own condition is simply "does the
+    // receiver have an AI", so we mirror it.
+    // We only feed the AI here; delivering the text to a human client stays the
+    // gateway's job, so there is no double delivery.
+    void OnClusterWhisper(char const* /*subject*/, char const* payload, int payloadLen)
+    {
+        if (!sPlayerbotAIConfig.enabled)
+            return;
+
+        std::string data(payload, payloadLen);
+        uint64 senderGUID = 0;
+        uint64 receiverGUID = 0;
+        std::string msg;
+        if (!ExtractJsonUInt64(data, "SenderGUID", senderGUID) || !senderGUID ||
+            !ExtractJsonUInt64(data, "ReceiverGUID", receiverGUID) || !receiverGUID ||
+            !ExtractJsonString(data, "Msg", msg) || msg.empty())
+            return;
+
+        // HandleCommand needs the sender as a local Player; a cross-shard
+        // sender cannot be resolved (same limitation as the group hook).
+        Player* sender = ObjectAccessor::FindPlayer(
+            ObjectGuid::Create<HighGuid::Player>(ObjectGuid::LowType(senderGUID)));
+        if (!sender)
+            return;
+
+        if (sender->GetSession() && sender->GetSession()->IsBot())
+            return;  // bot chatter already goes through the vanilla local hook
+
+        Player* receiver = ObjectAccessor::FindPlayer(
+            ObjectGuid::Create<HighGuid::Player>(ObjectGuid::LowType(receiverGUID)));
+        if (!receiver)
+            return;
+
+        if (PlayerbotAI* botAI = GET_PLAYERBOT_AI(receiver))
+            botAI->HandleCommand(CHAT_MSG_WHISPER, msg, sender);
+    }
+
+    // Guild chat re-injection. Vanilla semantics are deliberately preserved:
+    // only the sender's OWN bots react, never every bot of the guild — our
+    // main guild holds several hundred of them and a single line would
+    // otherwise command them all.
+    void OnClusterGuildChatMessage(char const* /*subject*/, char const* payload, int payloadLen)
+    {
+        if (!sPlayerbotAIConfig.enabled)
+            return;
+
+        std::string data(payload, payloadLen);
+        uint64 senderGUID = 0;
+        std::string msg;
+        if (!ExtractJsonUInt64(data, "SenderGUID", senderGUID) || !senderGUID ||
+            !ExtractJsonString(data, "Msg", msg) || msg.empty())
+            return;
+
+        Player* sender = ObjectAccessor::FindPlayer(
+            ObjectGuid::Create<HighGuid::Player>(ObjectGuid::LowType(senderGUID)));
+        if (!sender)
+            return;
+
+        if (sender->GetSession() && sender->GetSession()->IsBot())
+            return;
+
+        PlayerbotMgr* playerbotMgr = PlayerbotsMgr::instance().GetPlayerbotMgr(sender);
+        if (!playerbotMgr)
+            return;
+
+        for (PlayerBotMap::const_iterator it = playerbotMgr->GetPlayerBotsBegin();
+             it != playerbotMgr->GetPlayerBotsEnd(); ++it)
+        {
+            Player* const bot = it->second;
+            if (!bot || bot->GetGuildId() != sender->GetGuildId())
+                continue;
+
+            if (PlayerbotAI* botAI = GET_PLAYERBOT_AI(bot))
+                botAI->HandleCommand(CHAT_MSG_GUILD, msg, sender);
         }
     }
 
@@ -643,6 +730,8 @@ public:
                 sToCloud9Sidecar->NatsSubscribe(GROUP_INVITE_CREATED_SUBJECT, &OnClusterGroupInviteCreated) &&
                 sToCloud9Sidecar->NatsSubscribe(GUILD_INVITE_CREATED_SUBJECT, &OnClusterGuildInviteCreated) &&
                 sToCloud9Sidecar->NatsSubscribe(GROUP_MESSAGE_NEW_SUBJECT, &OnClusterGroupChatMessage) &&
+                sToCloud9Sidecar->NatsSubscribe(WHISPER_INCOME_SUBJECT, &OnClusterWhisper) &&
+                sToCloud9Sidecar->NatsSubscribe(GUILD_MESSAGE_NEW_SUBJECT, &OnClusterGuildChatMessage) &&
                 sToCloud9Sidecar->NatsSubscribe(MATCHMAKING_INVITED_SUBJECT, &OnClusterBGInvite) &&
                 sToCloud9Sidecar->NatsSubscribe(MATCHMAKING_QUEUED_SUBJECT, &OnClusterBGQueueJoined) &&
                 sToCloud9Sidecar->NatsSubscribe(MATCHMAKING_EXPIRED_SUBJECT, &OnClusterBGInviteExpired);
