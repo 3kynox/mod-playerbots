@@ -7,11 +7,13 @@
 #include "UseItemAction.h"
 
 #include "ChatHelper.h"
+#include "DBCStores.h"
 #include "Event.h"
 #include "ItemPackets.h"
 #include "ItemUsageValue.h"
 #include "PlayerbotTextMgr.h"
 #include "Playerbots.h"
+#include "SharedDefines.h"
 
 bool UseItemAction::Execute(Event event)
 {
@@ -479,6 +481,67 @@ bool UseRandomQuestItem::Execute(Event /*event*/)
                 break;
             }
         }
+
+        // A quest source item is not a quest starter: it has to be used ON something. Pick a
+        // nearby unit the item's spell can target, or a nearby game object whose lock accepts
+        // this item as its key.
+        uint32 const spellId = proto->Spells[0].SpellId;
+        if (!spellId)
+            continue;
+
+        GuidVector const npcs = AI_VALUE(GuidVector, "nearest npcs");
+        for (ObjectGuid const& npc : npcs)
+        {
+            Unit* unit = botAI->GetUnit(npc);
+            if (!unit)
+                continue;
+
+            if (botAI->CanCastSpell(spellId, unit, false))
+            {
+                item = questItem;
+                unitTarget = unit;
+                break;
+            }
+        }
+
+        if (item)
+            break;
+
+        GuidVector const gos = AI_VALUE(GuidVector, "nearest game objects no los");
+        for (ObjectGuid const& go : gos)
+        {
+            GameObject* gameObject = botAI->GetGameObject(go);
+            if (!gameObject)
+                continue;
+
+            uint32 const lockId = gameObject->GetGOInfo()->GetLockId();
+            if (!lockId)
+                continue;
+
+            LockEntry const* lock = sLockStore.LookupEntry(lockId);
+            if (!lock)
+                continue;
+
+            for (uint8 j = 0; j < MAX_LOCK_CASE; ++j)
+            {
+                if (lock->Type[j] != LOCK_KEY_ITEM)
+                    continue;
+
+                if (lock->Index[j] == proto->ItemId)
+                {
+                    item = questItem;
+                    goTarget = go;
+                    unitTarget = nullptr;
+                    break;
+                }
+            }
+
+            if (item)
+                break;
+        }
+
+        if (item)
+            break;
     }
 
     if (!item)
