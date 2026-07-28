@@ -149,7 +149,10 @@ bool OpenLootAction::DoLoot(LootObject& lootObject)
 
     // Block event-gated chests (Tribunal Chest, Gunship Armory) but allow
     // wild quest GOs (Moonpetal Lily etc.) when the bot is on the quest.
-    if (go && go->HasFlag(GAMEOBJECT_FLAGS, GO_FLAG_INTERACT_COND) && !lootObject.isNeededQuestItem)
+    // isNeededQuestItem only covers GOs listed in gameobject_questitem; ask the
+    // server itself for the rest, the way it answers a real client (PR #2579).
+    if (go && go->HasFlag(GAMEOBJECT_FLAGS, GO_FLAG_INTERACT_COND) && !lootObject.isNeededQuestItem &&
+        !go->ActivateToQuest(bot))
         return false;
 
     // This prevents raid chests like Gunship Armory (ICC) from being ninja'd by the bots

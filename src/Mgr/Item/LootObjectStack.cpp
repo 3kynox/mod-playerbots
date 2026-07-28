@@ -330,7 +330,10 @@ bool LootObject::IsLootPossible(Player* bot)
     GameObject* go = botAI->GetGameObject(guid);
     if (go && (go->HasFlag(GAMEOBJECT_FLAGS, GO_FLAG_NOT_SELECTABLE) || !go->isSpawned()))
         return false;
-    if (go && go->HasFlag(GAMEOBJECT_FLAGS, GO_FLAG_INTERACT_COND) && !isNeededQuestItem)
+    // isNeededQuestItem only covers GOs listed in gameobject_questitem; ask the
+    // server itself for the rest, the way it answers a real client (PR #2579).
+    if (go && go->HasFlag(GAMEOBJECT_FLAGS, GO_FLAG_INTERACT_COND) && !isNeededQuestItem &&
+        !go->ActivateToQuest(bot))
         return false;
 
     if (skillId == SKILL_NONE)
