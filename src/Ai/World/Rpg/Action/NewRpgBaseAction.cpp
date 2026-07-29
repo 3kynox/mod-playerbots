@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <limits>
 #include <sstream>
+#include <unordered_map>
+#include <unordered_set>
 
 #include "BroadcastHelper.h"
 #include "CellImpl.h"
@@ -903,10 +905,12 @@ bool NewRpgBaseAction::TryUseQuestItem(ObjectGuid& pursuedGO, ObjectGuid& pursue
     // ItemDrop on self can burn kill-credit sentinels and trigger
     // unintended scripted side effects.
     std::unordered_set<uint32> srcItemEntries;
-    std::unordered_set<uint32> neededCreatureEntries;
-    // RequiredNpcOrGo is negated when the objective is a gameobject
-    // (Healing the Lake: -181433 Irradiated Power Crystal).
-    std::unordered_set<uint32> neededGameObjectEntries;
+    // Pair every candidate item with the objectives of the quest that handed it
+    // out. Flat sets would let a bot fire one quest's item at another quest's
+    // objective, and RequiredNpcOrGo is negated when the objective is a
+    // gameobject (Healing the Lake: -181433 Irradiated Power Crystal).
+    std::unordered_map<uint32, std::unordered_set<uint32>> itemNeededCreatures;
+    std::unordered_map<uint32, std::unordered_set<uint32>> itemNeededGameObjects;
     for (uint16 slot = 0; slot < MAX_QUEST_LOG_SIZE; ++slot)
     {
         uint32 questId = bot->GetQuestSlotQuestId(slot);
@@ -917,17 +921,27 @@ bool NewRpgBaseAction::TryUseQuestItem(ObjectGuid& pursuedGO, ObjectGuid& pursue
         Quest const* quest = sObjectMgr->GetQuestTemplate(questId);
         if (!quest)
             continue;
+        std::unordered_set<uint32> questItems;
         if (uint32 src = quest->GetSrcItemId())
         {
             candidateItemEntries.insert(src);
             srcItemEntries.insert(src);
+            questItems.insert(src);
         }
         // handed out by the quest (brands, flares, nets, standards)
         for (int i = 0; i < QUEST_SOURCE_ITEM_IDS_COUNT; ++i)
         {
             if (uint32 drop = quest->ItemDrop[i])
+            {
                 candidateItemEntries.insert(drop);
+                questItems.insert(drop);
+            }
         }
+        if (questItems.empty())
+            continue;
+
+        std::unordered_set<uint32> questCreatures;
+        std::unordered_set<uint32> questGameObjects;
         QuestStatusData const& qs = bot->getQuestStatusMap().at(questId);
         for (int i = 0; i < QUEST_OBJECTIVES_COUNT; ++i)
         {
@@ -937,9 +951,14 @@ bool NewRpgBaseAction::TryUseQuestItem(ObjectGuid& pursuedGO, ObjectGuid& pursue
             if (qs.CreatureOrGOCount[i] >= quest->RequiredNpcOrGoCount[i])
                 continue;
             if (entry > 0)
-                neededCreatureEntries.insert(uint32(entry));
+                questCreatures.insert(uint32(entry));
             else
-                neededGameObjectEntries.insert(uint32(-entry));
+                questGameObjects.insert(uint32(-entry));
+        }
+        for (uint32 questItem : questItems)
+        {
+            itemNeededCreatures[questItem].insert(questCreatures.begin(), questCreatures.end());
+            itemNeededGameObjects[questItem].insert(questGameObjects.begin(), questGameObjects.end());
         }
     }
     if (candidateItemEntries.empty())
@@ -968,6 +987,15 @@ bool NewRpgBaseAction::TryUseQuestItem(ObjectGuid& pursuedGO, ObjectGuid& pursue
         SpellInfo const* spellInfo = sSpellMgr->GetSpellInfo(useSpellId);
         if (!spellInfo)
             continue;
+
+        // objectives of the quest this very item came from — never another's
+        static std::unordered_set<uint32> const noEntries;
+        auto creatureIt = itemNeededCreatures.find(itemEntry);
+        std::unordered_set<uint32> const& neededCreatureEntries =
+            creatureIt != itemNeededCreatures.end() ? creatureIt->second : noEntries;
+        auto goIt = itemNeededGameObjects.find(itemEntry);
+        std::unordered_set<uint32> const& neededGameObjectEntries =
+            goIt != itemNeededGameObjects.end() ? goIt->second : noEntries;
 
         // A: spell needs a focus GO (moonwell / lectern / anvil)
         if (uint32 focusId = spellInfo->RequiresSpellFocus)
