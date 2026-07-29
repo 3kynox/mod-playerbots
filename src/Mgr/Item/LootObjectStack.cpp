@@ -6,6 +6,7 @@
 
 #include "LootObjectStack.h"
 
+#include "Log.h"
 #include "LootMgr.h"
 #include "Object.h"
 #include "ObjectAccessor.h"
@@ -376,7 +377,14 @@ bool LootObjectStack::Add(ObjectGuid guid)
     completedLoot.shrink(time(nullptr) - 300);
 
     if (completedLoot.find(guid) != completedLoot.end())
+    {
+        // LOOTDBG (temporaire, build de mesure) : combien de GO sont
+        // rendus invisibles par la liste completedLoot (fenêtre 300 s) ?
+        if (guid.IsGameObject())
+            LOG_ERROR("playerbots", "LOOTDBG add-blocked bot={} entry={} guid={}", bot->GetName(),
+                     guid.GetEntry(), guid.GetCounter());
         return false;
+    }
 
     if (availableLoot.size() >= MAX_LOOT_OBJECT_COUNT)
     {
@@ -401,8 +409,13 @@ void LootObjectStack::Remove(ObjectGuid guid)
         availableLoot.erase(i);
 }
 
-void LootObjectStack::MarkCompleted(ObjectGuid guid)
+void LootObjectStack::MarkCompleted(ObjectGuid guid, char const* src)
 {
+    // LOOTDBG (temporaire) : d'où vient la mise en liste noire d'un GO ?
+    if (guid.IsGameObject())
+        LOG_ERROR("playerbots", "LOOTDBG completed bot={} entry={} guid={} src={}", bot->GetName(),
+                 guid.GetEntry(), guid.GetCounter(), src);
+
     Remove(guid);
     completedLoot.insert(guid);
 }
@@ -449,7 +462,19 @@ LootObject LootObjectStack::GetNearest(float maxDistance)
         LootObject lootObject(bot, guid);
 
         if (!lootObject.IsLootPossible(bot))
+        {
+            // LOOTDBG (temporaire) : un GO porteur d'un objet de quête
+            // nécessaire est écarté — 1 ligne / GO / 10 s.
+            if (guid.IsGameObject() && lootObject.isNeededQuestItem)
+            {
+                dbgLogged.shrink(time(nullptr) - 10);
+                if (dbgLogged.insert(guid).second)
+                    LOG_ERROR("playerbots", "LOOTDBG reject-quest bot={} entry={} dist={} skill={} req={}",
+                             bot->GetName(), guid.GetEntry(), distance, lootObject.skillId,
+                             lootObject.reqSkillValue);
+            }
             continue;
+        }
 
         nearestDistance = distance;
         nearest = lootObject;

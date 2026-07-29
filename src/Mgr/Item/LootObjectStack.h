@@ -77,7 +77,7 @@ public:
 
     bool Add(ObjectGuid guid);
     void Remove(ObjectGuid guid);
-    void MarkCompleted(ObjectGuid guid);
+    void MarkCompleted(ObjectGuid guid, char const* src = "?");
     void Clear();
     bool CanLoot(float maxDistance);
     LootObject GetLoot(float maxDistance = 0);
@@ -90,6 +90,8 @@ private:
     // Guids we already opened loot on; blocks "add all loot" from
     // re-adding the same corpse before it despawns.
     LootTargetList completedLoot;
+    // LOOTDBG (temporaire) : anti-répétition des lignes de diagnostic
+    LootTargetList dbgLogged;
 };
 
 #endif

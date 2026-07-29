@@ -84,7 +84,7 @@ bool OpenLootAction::Execute(Event /*event*/)
         // "nearest corpses" without a lootable filter, so a plain
         // Remove lets the same corpse re-enter the stack on the next
         // tick. The completed set blocks re-add for ~5 min.
-        AI_VALUE(LootObjectStack*, "available loot")->MarkCompleted(lootObject.guid);
+        AI_VALUE(LootObjectStack*, "available loot")->MarkCompleted(lootObject.guid, "openloot");
         context->GetValue<LootObject>("loot target")->Set(LootObject());
     }
     return result;
@@ -141,6 +141,12 @@ bool OpenLootAction::DoLoot(LootObject& lootObject)
     }
 
     GameObject* go = botAI->GetGameObject(lootObject.guid);
+    // LOOTDBG (temporaire) : pourquoi l'ouverture d'un GO de quête échoue-t-elle ?
+    if (go && lootObject.isNeededQuestItem)
+        LOG_ERROR("playerbots", "LOOTDBG doloot bot={} entry={} dist3d={} state={} moving={}",
+                 bot->GetName(), go->GetEntry(), bot->GetDistance(go), uint32(go->GetGoState()),
+                 uint32(bot->isMoving()));
+
     if (go && bot->GetDistance(go) > INTERACTION_DISTANCE - 2.0f)
         return false;
 
@@ -522,7 +528,7 @@ bool StoreLootAction::Execute(Event event)
         BroadcastHelper::BroadcastLootingItem(botAI, bot, proto);
     }
 
-    AI_VALUE(LootObjectStack*, "available loot")->MarkCompleted(guid);
+    AI_VALUE(LootObjectStack*, "available loot")->MarkCompleted(guid, "storeloot");
 
     // release loot
     WorldPacket* packet = new WorldPacket(CMSG_LOOT_RELEASE, 8);
