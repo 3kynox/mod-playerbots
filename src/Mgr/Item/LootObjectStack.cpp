@@ -134,6 +134,21 @@ void LootObject::Refresh(Player* bot, ObjectGuid lootGUID)
             Loot loot;
             lootTemplate->Process(loot, LootTemplates_Gameobject, 1, bot);
 
+            // Loot::AddItem routes QuestRequired entries to quest_items, never
+            // to items, so the scan below cannot see them — Corrupted Flower
+            // (quest 9799) and every other QuestRequired drop went unflagged.
+            // Same handling as the gameobject_questitem loop above: flag and
+            // keep reading, a gathering node may still need its skill.
+            for (const LootItem& item : loot.quest_items)
+            {
+                if (!item.itemid || !IsNeededForQuest(bot, item.itemid))
+                    continue;
+
+                this->guid = lootGUID;
+                this->isNeededQuestItem = true;
+                neededQuestItem = true;
+            }
+
             for (const LootItem& item : loot.items)
             {
                 uint32 itemId = item.itemid;
@@ -204,6 +219,13 @@ void LootObject::Refresh(Player* bot, ObjectGuid lootGUID)
         if (!lockInfo)
             return;
 
+        // A lock holds up to 8 alternative ways in; the client opens the
+        // object as soon as ONE of them is satisfied. Recording a skill
+        // requirement unconditionally kept only the last one and hid any
+        // free alternative — Corrupted Flower (lock 259) pairs
+        // OPEN_KNEELING, which needs no skill, with HERBALISM, so every
+        // non-herbalist bot was refused an object a player right-clicks.
+        bool hasFreeEntry = false;
         for (uint8 i = 0; i < 8; ++i)
         {
             switch (lockInfo->Type[i])
@@ -220,6 +242,7 @@ void LootObject::Refresh(Player* bot, ObjectGuid lootGUID)
                     if (goId == 13891 || goId == 19535)  // Serpentbloom
                     {
                         this->guid = lootGUID;
+                        hasFreeEntry = true;
                     }
                     else if (SkillByLockType(LockType(lockInfo->Index[i])) > 0)
                     {
@@ -227,12 +250,25 @@ void LootObject::Refresh(Player* bot, ObjectGuid lootGUID)
                         reqSkillValue = std::max((uint32)1, lockInfo->Skill[i]);
                         guid = lootGUID;
                     }
+                    else if (lockInfo->Index[i] > 0)
+                    {
+                        // OPEN, TREASURE, OPEN_KNEELING… map to SKILL_NONE:
+                        // an opening spell is enough, no profession needed.
+                        guid = lootGUID;
+                        hasFreeEntry = true;
+                    }
                     break;
 
                 case LOCK_KEY_NONE:
                     guid = lootGUID;
                     break;
             }
+        }
+
+        if (hasFreeEntry)
+        {
+            skillId = SKILL_NONE;
+            reqSkillValue = 0;
         }
     }
 }
@@ -404,7 +440,17 @@ void LootObjectStack::Remove(ObjectGuid guid)
 void LootObjectStack::MarkCompleted(ObjectGuid guid)
 {
     Remove(guid);
-    completedLoot.insert(guid);
+
+    // Corpses only. "add all loot" re-reads "nearest corpses" without a
+    // lootable filter, so a plain Remove lets the same corpse back into
+    // the stack on the very next tick — that is what this list is for.
+    // Gameobjects need no such guard: Refresh() already drops anything
+    // that is not spawned and GO_STATE_READY. Blacklisting one is
+    // actively harmful, because DoLoot() reports success as soon as the
+    // opening is *started*, so an opening that yields nothing hides the
+    // object from this bot for the full 300 s window.
+    if (guid.IsAnyTypeCreature())
+        completedLoot.insert(guid);
 }
 
 void LootObjectStack::Clear()
