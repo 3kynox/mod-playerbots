@@ -12,7 +12,6 @@
 #include "Creature.h"
 #include "GridNotifiers.h"
 #include "GridNotifiersImpl.h"
-#include "NearestGameObjects.h"
 #include "G3D/Vector2.h"
 #include "GameObject.h"
 #include "GossipDef.h"
@@ -906,11 +905,10 @@ bool NewRpgBaseAction::TryUseQuestItem(ObjectGuid& pursuedGO, ObjectGuid& pursue
     // unintended scripted side effects.
     std::unordered_set<uint32> srcItemEntries;
     // Pair every candidate item with the objectives of the quest that handed it
-    // out. Flat sets would let a bot fire one quest's item at another quest's
-    // objective, and RequiredNpcOrGo is negated when the objective is a
-    // gameobject (Healing the Lake: -181433 Irradiated Power Crystal).
+    // out; flat sets would let a bot fire one quest's item at another quest's
+    // objective. Gameobject objectives are deliberately absent: TryUseQuestGO
+    // already handles those, and it is the only path that grants the credit.
     std::unordered_map<uint32, std::unordered_set<uint32>> itemNeededCreatures;
-    std::unordered_map<uint32, std::unordered_set<uint32>> itemNeededGameObjects;
     for (uint16 slot = 0; slot < MAX_QUEST_LOG_SIZE; ++slot)
     {
         uint32 questId = bot->GetQuestSlotQuestId(slot);
@@ -941,7 +939,6 @@ bool NewRpgBaseAction::TryUseQuestItem(ObjectGuid& pursuedGO, ObjectGuid& pursue
             continue;
 
         std::unordered_set<uint32> questCreatures;
-        std::unordered_set<uint32> questGameObjects;
         QuestStatusData const& qs = bot->getQuestStatusMap().at(questId);
         for (int i = 0; i < QUEST_OBJECTIVES_COUNT; ++i)
         {
@@ -952,14 +949,9 @@ bool NewRpgBaseAction::TryUseQuestItem(ObjectGuid& pursuedGO, ObjectGuid& pursue
                 continue;
             if (entry > 0)
                 questCreatures.insert(uint32(entry));
-            else
-                questGameObjects.insert(uint32(-entry));
         }
         for (uint32 questItem : questItems)
-        {
             itemNeededCreatures[questItem].insert(questCreatures.begin(), questCreatures.end());
-            itemNeededGameObjects[questItem].insert(questGameObjects.begin(), questGameObjects.end());
-        }
     }
     if (candidateItemEntries.empty())
         return false;
@@ -993,9 +985,6 @@ bool NewRpgBaseAction::TryUseQuestItem(ObjectGuid& pursuedGO, ObjectGuid& pursue
         auto creatureIt = itemNeededCreatures.find(itemEntry);
         std::unordered_set<uint32> const& neededCreatureEntries =
             creatureIt != itemNeededCreatures.end() ? creatureIt->second : noEntries;
-        auto goIt = itemNeededGameObjects.find(itemEntry);
-        std::unordered_set<uint32> const& neededGameObjectEntries =
-            goIt != itemNeededGameObjects.end() ? goIt->second : noEntries;
 
         // A: spell needs a focus GO (moonwell / lectern / anvil)
         if (uint32 focusId = spellInfo->RequiresSpellFocus)
@@ -1152,89 +1141,21 @@ bool NewRpgBaseAction::TryUseQuestItem(ObjectGuid& pursuedGO, ObjectGuid& pursue
             continue;
         }
 
-        // A2: spell needs a gameobject target (Healing the Lake: item 22955
-        // casts 28700, implicit target TARGET_GAMEOBJECT_TARGET, on GO 181433).
-        // Without this branch such items fell through to C and were fired on
-        // the bot itself, which can never satisfy a GO-target spell.
-        if ((spellInfo->GetExplicitTargetMask() & (TARGET_FLAG_GAMEOBJECT | TARGET_FLAG_GAMEOBJECT_ITEM)) &&
-            !neededGameObjectEntries.empty())
-        {
-            auto isValidQuestGO = [&](GameObject* go) -> bool
-            {
-                if (!go || !go->IsInWorld() || !go->isSpawned())
-                    return false;
-                if (!(go->GetPhaseMask() & bot->GetPhaseMask()))
-                    return false;
-                return neededGameObjectEntries.count(go->GetEntry()) > 0;
-            };
-
-            // commitment first
-            if (pursuedGO)
-            {
-                GameObject* existing = botAI->GetGameObject(pursuedGO);
-                if (existing && isValidQuestGO(existing) && bot->GetDistance(existing) <= searchRange)
-                {
-                    if (bot->GetDistance(existing) > INTERACTION_DISTANCE)
-                        return MoveWorldObjectTo(existing->GetGUID(), INTERACTION_DISTANCE);
-                    SpellCastTargets targets;
-                    targets.SetGOTarget(existing);
-                    bot->CastItemUseSpell(item, targets, 1, 0);
-                    ForceToWait(2000);
-                    pursuedGO.Clear();
-                    return true;
-                }
-                pursuedGO.Clear();
-            }
-
-            std::list<GameObject*> nearbyGOs;
-            AnyGameObjectInObjectRangeCheck goCheck(bot, searchRange);
-            Acore::GameObjectListSearcher<AnyGameObjectInObjectRangeCheck> goSearcher(bot, nearbyGOs, goCheck);
-            Cell::VisitObjects(bot, goSearcher, searchRange);
-
-            GameObject* bestGO = nullptr;
-            float bestGODist = searchRange;
-            for (GameObject* go : nearbyGOs)
-            {
-                if (!isValidQuestGO(go))
-                    continue;
-                float d = bot->GetDistance(go);
-                if (d >= bestGODist)
-                    continue;
-                bestGO = go;
-                bestGODist = d;
-            }
-            if (bestGO)
-            {
-                pursuedGO = bestGO->GetGUID();
-                if (bot->GetDistance(bestGO) > INTERACTION_DISTANCE)
-                    return MoveWorldObjectTo(bestGO->GetGUID(), INTERACTION_DISTANCE);
-                SpellCastTargets targets;
-                targets.SetGOTarget(bestGO);
-                LOG_ERROR("playerbots", "QUESTITEM cast-go bot={} item={} spell={} target={} dist={}",
-                          bot->GetName(), itemEntry, useSpellId, bestGO->GetEntry(), bestGODist);
-                bot->CastItemUseSpell(item, targets, 1, 0);
-                ForceToWait(2000);
-                pursuedGO.Clear();
-                return true;
-            }
-            if (!urand(0, 49))  // sampled: no ForceToWait on this path
-                LOG_ERROR("playerbots", "QUESTITEM no-go s50 bot={} item={} spell={} needed={} scanned={}",
-                          bot->GetName(), itemEntry, useSpellId,
-                          neededGameObjectEntries.size(), nearbyGOs.size());
-            continue;
-        }
-
         // C: self / area — fire at bot's position. Restrict to GetSrcItemId
         // items (the single item the quest hands the bot for self-use, e.g.
         // a potion). ItemDrop entries can be kill-credit sentinels or
         // scripted items that should never be auto-used on self.
         if (!srcItemEntries.count(itemEntry))
             continue;
-        // A gameobject-target spell can never be satisfied by a self cast:
-        // firing 28700 (Disperse Neutralizing Agent, quest 9294) at the bot
-        // only yields SPELL_FAILED_BAD_TARGETS, and every attempt burns the
-        // 2 s wait below. Unit-target spells are left alone — the bot itself
-        // is a valid unit target for those.
+        // A gameobject-target spell can never be satisfied by a self cast, and
+        // the attempt is worse than useless. DoIncompleteQuest calls
+        // TryUseQuestItem before TryLootQuestGO and TryUseQuestGO, so firing
+        // 28700 (Disperse Neutralizing Agent, quest 9294) at the bot fails with
+        // SPELL_FAILED_BAD_TARGETS and still returns true below, shadowing the
+        // two functions that would have worked. TryUseQuestGO calls
+        // GameObject::Use, the only path reaching KillCreditGO and therefore the
+        // only way a negative RequiredNpcOrGo objective is ever credited.
+        // Unit-target spells are left alone — the bot is a valid unit target.
         if (spellInfo->GetExplicitTargetMask() & (TARGET_FLAG_GAMEOBJECT | TARGET_FLAG_GAMEOBJECT_ITEM))
         {
             if (!urand(0, 49))  // sampled: no ForceToWait on this path
