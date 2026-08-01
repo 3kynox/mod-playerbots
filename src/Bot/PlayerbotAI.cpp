@@ -40,6 +40,7 @@
 #include "Player.h"
 #include "PlayerbotTextMgr.h"
 #include "PlayerbotAIConfig.h"
+#include "PlayerbotFactory.h"
 #include "PlayerbotMgr.h"
 #include "PlayerbotGuildMgr.h"
 #include "Playerbots.h"
@@ -265,6 +266,8 @@ void PlayerbotAI::UpdateAI(uint32 elapsed, bool minimal)
     }
 
     AllowActivity();
+
+    CheckSelfBotMaintenance();
 
     if (!CanUpdateAI())
         return;
@@ -4490,7 +4493,52 @@ bool PlayerbotAI::HasRealPlayerMaster()
 
 bool PlayerbotAI::HasActivePlayerMaster() { return master && !GET_PLAYERBOT_AI(master); }
 
-bool PlayerbotAI::IsAltBot() { return HasRealPlayerMaster() && !sRandomPlayerbotMgr.IsRandomBot(bot); }
+bool PlayerbotAI::IsAltBot()
+{
+    if (ActsAsRandomBot())
+        return false;
+
+    return HasRealPlayerMaster() && !sRandomPlayerbotMgr.IsRandomBot(bot);
+}
+
+// A selfbot exists to observe what a random bot does. By construction it can
+// never be one: IsRealPlayer() is true (master == bot), and both IsRandomBot()
+// and IsAltBot() branch on that, so the module treats it as an alt bot
+// everywhere — no `grind`/`new rpg`, and above all no periodic randomization,
+// which is what teaches spells, refreshes gear and empties the bag.
+bool PlayerbotAI::ActsAsRandomBot()
+{
+    return sPlayerbotAIConfig.selfBotActsAsRandomBot && IsRealPlayer();
+}
+
+// The maintenance a random bot gets for free from RandomPlayerbotMgr. Runs
+// once on activation, then on the same 2h-24h cadence.
+//
+// Deliberately calls PlayerbotFactory::Randomize(true) directly rather than
+// RandomPlayerbotMgr::Randomize(), which reroutes to RandomizeFirst() below
+// level 3 and would reroll the character's level to urand(1, 80) — acceptable
+// on a throwaway bot, not on a player's own character. Enrolment in
+// currentBots and RandomTeleportForLevel() are left out for the same reason:
+// they would log the character out mid-session or teleport it across the world.
+void PlayerbotAI::CheckSelfBotMaintenance()
+{
+    if (!ActsAsRandomBot() || !bot->IsInWorld() || bot->InBattleground())
+        return;
+
+    uint32 now = getMSTime();
+    if (lastSelfBotMaintenance && GetMSTimeDiffToNow(lastSelfBotMaintenance) < selfBotMaintenanceDelay)
+        return;
+
+    lastSelfBotMaintenance = now;
+    selfBotMaintenanceDelay =
+        urand(sPlayerbotAIConfig.minRandomBotRandomizeTime, sPlayerbotAIConfig.maxRandomBotRandomizeTime) * IN_MILLISECONDS;
+
+    PlayerbotFactory factory(bot, bot->GetLevel());
+    factory.Randomize(true);
+
+    LOG_INFO("playerbots", "SELFBOTMAINT ts={} bot={} level={} nextInSecs={}", uint32(time(nullptr)),
+             bot->GetName(), uint32(bot->GetLevel()), selfBotMaintenanceDelay / IN_MILLISECONDS);
+}
 
 Player* PlayerbotAI::GetGroupLeader()
 {

@@ -540,6 +540,9 @@ public:
 
     // Checks if the bot is really a player. Players always have themselves as master.
     bool IsRealPlayer() { return master ? (master == bot) : false; }
+    // Selfbot promoted to random-bot semantics (AiPlayerbot.SelfBotActsAsRandomBot).
+    bool ActsAsRandomBot();
+    void CheckSelfBotMaintenance();
     // Bot has a master that is a player.
     bool HasRealPlayerMaster();
     // Bot has a master that is activly playing.
@@ -630,6 +633,10 @@ private:
                !player->IsBeingTeleported();
     }
 protected:
+    // Selfbot periodic maintenance (see CheckSelfBotMaintenance).
+    uint32 lastSelfBotMaintenance{0};
+    uint32 selfBotMaintenanceDelay{0};
+
     Player* bot;
     Player* master;
     uint32 accountId;

@@ -402,6 +402,9 @@ public:
     std::vector<uint32> randomBotArenaTeams;
 
     uint32 selfBotLevel;
+    // Give a selfbot the random-bot strategy set and periodic maintenance, so
+    // it behaves like the rndbot it is meant to let you observe.
+    bool selfBotActsAsRandomBot;
     bool downgradeMaxLevelBot;
     bool equipAndSpecPersistence;
     int32 equipAndSpecPersistenceLevel;

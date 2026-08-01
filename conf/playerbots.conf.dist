@@ -187,6 +187,27 @@ AiPlayerbot.SummonWhenGroup = 1
 # Selfbot permission level (0 = disabled, 1 = GM only (default), 2 = all players, 3 = activate on login)
 AiPlayerbot.SelfBotLevel = 1
 
+#
+#    AiPlayerbot.SelfBotActsAsRandomBot
+#        Description: Treat a selfbot as a random bot instead of an alt bot.
+#                     A selfbot has master == bot, so IsRealPlayer() is true and
+#                     IsRandomBot() returns false before any other check. It
+#                     therefore never receives the grind / new rpg / bg / lfg
+#                     strategies, and never goes through the periodic
+#                     randomization that teaches spells, refreshes gear and
+#                     empties the bag -- which is what a selfbot is normally
+#                     activated to observe.
+#                     Enabling this grants both. It does NOT enrol the character
+#                     in the random bot pool: no forced logout, no random
+#                     teleport, no level reroll.
+#                     WARNING: the periodic maintenance calls ClearInventory(),
+#                     which DESTROYS the bag contents (it is not a sale), on the
+#                     same 2h-24h cadence as a random bot.
+#        Default:     0 (off - upstream behaviour, selfbot is an alt bot)
+#                     1 (selfbot behaves as a random bot)
+
+AiPlayerbot.SelfBotActsAsRandomBot = 0
+
 # Non-GM player can only use init=auto to initialize bots based on their own level and gearscore
 # Default: 0 (non-GM player can use any intialization commands)
 AiPlayerbot.AutoInitOnly = 0

@@ -752,6 +752,7 @@ bool PlayerbotAIConfig::Initialize()
     randomBotArenaTeamMinRating = sConfigMgr->GetOption<int32>("AiPlayerbot.RandomBotArenaTeamMinRating", 1000);
 
     selfBotLevel = sConfigMgr->GetOption<int32>("AiPlayerbot.SelfBotLevel", 1);
+    selfBotActsAsRandomBot = sConfigMgr->GetOption<bool>("AiPlayerbot.SelfBotActsAsRandomBot", false);
 
     RandomPlayerbotFactory::CreateRandomBots();
     if (World::IsStopped())

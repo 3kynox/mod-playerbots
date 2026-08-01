@@ -589,7 +589,11 @@ void AiFactory::AddDefaultNonCombatStrategies(Player* player, PlayerbotAI* const
     if (sPlayerbotAIConfig.autoSaveMana && PlayerbotAI::IsHeal(player, true))
         nonCombatEngine->addStrategy("save mana", false);
 
-    if ((sRandomPlayerbotMgr.IsRandomBot(player)) && !player->InBattleground())
+    // A selfbot is never IsRandomBot() (IsRealPlayer() short-circuits it), so
+    // without this it never gets grind / new rpg / bg / lfg — the very
+    // behaviours it is activated to observe.
+    if ((sRandomPlayerbotMgr.IsRandomBot(player) || (facade && facade->ActsAsRandomBot())) &&
+        !player->InBattleground())
     {
         Player* master = facade->GetMaster();
 
