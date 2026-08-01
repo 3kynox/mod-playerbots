@@ -34,6 +34,9 @@ void NewRpgInfo::ChangeToDoQuest(uint32 questId, const Quest* quest)
     DoQuest do_quest;
     do_quest.questId = questId;
     do_quest.quest = quest;
+    // Single entry point of RPG_DO_QUEST: stamp the start of the pursuit of
+    // *this quest*. Unlike lastReachPOI, nothing resets it on POI rotation.
+    do_quest.questPursuitStart = getMSTime();
     data = do_quest;
 }
 

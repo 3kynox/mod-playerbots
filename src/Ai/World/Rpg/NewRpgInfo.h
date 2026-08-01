@@ -53,6 +53,14 @@ struct NewRpgInfo
         ObjectGuid pursuedLootGO{};      // GOs we loot (lilies, eggs)
         ObjectGuid pursuedUseGO{};       // GOs we click or focus on
         ObjectGuid pursuedUseTarget{};   // creature we apply an item to
+        // Whole-quest watchdog. lastReachPOI above times the *current POI*
+        // and the POI rotation resets it, so on a multi-POI quest it never
+        // reaches poiStayTime and the abandon guard never fires. These
+        // track the pursuit of the quest itself and nothing resets them.
+        uint32 questPursuitStart{0};
+        bool countersSnapshot{false};
+        uint32 startCreatureOrGOCount[QUEST_OBJECTIVES_COUNT]{};
+        uint32 startItemCount[QUEST_ITEM_OBJECTIVES_COUNT]{};
     };
     // RPG_TRAVEL_FLIGHT
     struct TravelFlight

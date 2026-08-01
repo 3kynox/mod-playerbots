@@ -94,8 +94,12 @@ public:
 protected:
     bool DoIncompleteQuest(NewRpgInfo::DoQuest& data);
     bool DoCompletedQuest(NewRpgInfo::DoQuest& data);
+    bool CheckQuestPursuitWatchdog(NewRpgInfo::DoQuest& data);
 
     const uint32 poiStayTime = 5 * 60 * 1000;
+    // Whole-quest give-up delay. Must stay well above poiStayTime so the
+    // per-POI guard keeps its chance to fire first on single-POI quests.
+    const uint32 questAbandonTime = 15 * 60 * 1000;
 };
 
 class NewRpgTravelFlightAction : public NewRpgBaseAction

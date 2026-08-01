@@ -276,9 +276,79 @@ bool NewRpgDoQuestAction::Execute(Event /*event*/)
     return true;
 }
 
+// Whole-quest watchdog.
+//
+// The existing guard below times `lastReachPOI`, which the POI rotation
+// (scoutTimeoutMs, 30s) resets to 0. On a quest with several POIs the 5-minute
+// counter therefore never matures and the quest is never abandoned: the bot
+// shuttles between markers forever (BUG-TC9-060). On a single-POI quest
+// `alternatives` is empty, nothing is reset, and that guard does work — so it
+// is left untouched.
+//
+// This one times the pursuit of the *quest*, snapshots *every* objective
+// counter (the old guard only looks at data.objectiveIdx, which the rotation
+// keeps changing) and gives up when nothing at all has moved.
+//
+// Returns true when it handled the tick (quest abandoned).
+bool NewRpgDoQuestAction::CheckQuestPursuitWatchdog(NewRpgInfo::DoQuest& data)
+{
+    uint32 questId = data.questId;
+    Quest const* quest = sObjectMgr->GetQuestTemplate(questId);
+    if (!quest)
+        return false;
+
+    auto statusItr = bot->getQuestStatusMap().find(questId);
+    if (statusItr == bot->getQuestStatusMap().end())
+        return false;
+    const QuestStatusData& q_status = statusItr->second;
+
+    if (!data.countersSnapshot)
+    {
+        for (uint8 i = 0; i < QUEST_OBJECTIVES_COUNT; ++i)
+            data.startCreatureOrGOCount[i] = q_status.CreatureOrGOCount[i];
+        for (uint8 i = 0; i < QUEST_ITEM_OBJECTIVES_COUNT; ++i)
+            data.startItemCount[i] = q_status.ItemCount[i];
+        data.countersSnapshot = true;
+        if (!data.questPursuitStart)
+            data.questPursuitStart = getMSTime();
+        return false;
+    }
+
+    if (!data.questPursuitStart || GetMSTimeDiffToNow(data.questPursuitStart) < questAbandonTime)
+        return false;
+
+    bool progressed = false;
+    for (uint8 i = 0; i < QUEST_OBJECTIVES_COUNT && !progressed; ++i)
+        if (q_status.CreatureOrGOCount[i] != data.startCreatureOrGOCount[i])
+            progressed = true;
+    for (uint8 i = 0; i < QUEST_ITEM_OBJECTIVES_COUNT && !progressed; ++i)
+        if (q_status.ItemCount[i] != data.startItemCount[i])
+            progressed = true;
+
+    if (progressed)
+    {
+        // Something moved: re-arm the window from now instead of abandoning,
+        // so a slow but working quest is never dropped.
+        data.questPursuitStart = getMSTime();
+        data.countersSnapshot = false;
+        return false;
+    }
+
+    botAI->lowPriorityQuest.insert(questId);
+    botAI->rpgStatistic.questAbandoned++;
+    LOG_INFO("playerbots", "QUESTABANDON ts={} bot={} quest={} secs={} reason=no-objective-progress",
+             uint32(time(nullptr)), bot->GetName(), questId, questAbandonTime / 1000);
+    botAI->rpgInfo.ChangeToIdle();
+    return true;
+}
+
 bool NewRpgDoQuestAction::DoIncompleteQuest(NewRpgInfo::DoQuest& data)
 {
     uint32 questId = data.questId;
+
+    if (CheckQuestPursuitWatchdog(data))
+        return true;
+
     if (data.pos != WorldPosition())
     {
         /// @TODO: extract to a new function
