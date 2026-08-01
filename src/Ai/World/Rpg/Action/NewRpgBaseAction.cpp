@@ -9,6 +9,7 @@
 #include "BroadcastHelper.h"
 #include "CellImpl.h"
 #include "ChatHelper.h"
+#include "ConditionMgr.h"
 #include "Creature.h"
 #include "GridNotifiers.h"
 #include "GridNotifiersImpl.h"
@@ -986,6 +987,27 @@ bool NewRpgBaseAction::TryUseQuestItem(ObjectGuid& pursuedGO, ObjectGuid& pursue
         std::unordered_set<uint32> const& neededCreatureEntries =
             creatureIt != itemNeededCreatures.end() ? creatureIt->second : noEntries;
 
+        // RequiredNpcOrGo is frequently a kill-credit sentinel that is never
+        // spawned anywhere: the entry the spell may actually be cast on lives
+        // in `conditions`. Quest 9303 asks for 16534 but the spell (29528) is
+        // restricted to 16518, and its script then awards the 16534 credit.
+        // A spell can name several valid entries (quest 6124: 12298 and 12296),
+        // hence a set. When `conditions` says nothing, keep the old behaviour.
+        std::unordered_set<uint32> allowedTargets;
+        for (Condition* cond :
+             sConditionMgr->GetConditionsForNotGroupedEntry(CONDITION_SOURCE_TYPE_SPELL, useSpellId))
+        {
+            if (!cond || cond->NegativeCondition)
+                continue;
+            if (cond->ConditionType == CONDITION_OBJECT_ENTRY_GUID &&
+                cond->ConditionValue1 == uint32(TYPEID_UNIT) && cond->ConditionValue2)
+                allowedTargets.insert(cond->ConditionValue2);
+            else if (cond->ConditionType == CONDITION_NEAR_CREATURE && cond->ConditionValue1)
+                allowedTargets.insert(cond->ConditionValue1);
+        }
+        std::unordered_set<uint32> const& targetEntries =
+            !allowedTargets.empty() ? allowedTargets : neededCreatureEntries;
+
         // A: spell needs a focus GO (moonwell / lectern / anvil)
         if (uint32 focusId = spellInfo->RequiresSpellFocus)
         {
@@ -1059,7 +1081,7 @@ bool NewRpgBaseAction::TryUseQuestItem(ObjectGuid& pursuedGO, ObjectGuid& pursue
         }
 
         // B: spell needs a unit target — walk to the required creature
-        if (spellInfo->NeedsExplicitUnitTarget() && !neededCreatureEntries.empty())
+        if (spellInfo->NeedsExplicitUnitTarget() && !targetEntries.empty())
         {
             auto isValidCreature = [&](Creature* c) -> bool
             {
@@ -1067,7 +1089,7 @@ bool NewRpgBaseAction::TryUseQuestItem(ObjectGuid& pursuedGO, ObjectGuid& pursue
                     return false;
                 if (!(c->GetPhaseMask() & bot->GetPhaseMask()))
                     return false;
-                return neededCreatureEntries.count(c->GetEntry()) > 0;
+                return targetEntries.count(c->GetEntry()) > 0;
             };
 
             // commitment first
@@ -1126,18 +1148,17 @@ bool NewRpgBaseAction::TryUseQuestItem(ObjectGuid& pursuedGO, ObjectGuid& pursue
                 pursuedTarget.Clear();
                 return true;
             }
-            // No spawn carries the required entry: for half of the "use item on
-            // a creature" quests RequiredNpcOrGo is a kill-credit sentinel
-            // granted by the spell script (9303 wants 16534 "Inoculated
-            // Nestlewood Owlkin", which is never spawned — the castable
-            // creature is 16518). Nothing in the DB links the two; log it so
-            // the size of that class can be measured before guessing.
+            // No spawn carries any acceptable entry. When `conditions` did
+            // resolve a target (cond=1) this simply means none is in range;
+            // when it did not (cond=0) we are back to the sentinel case —
+            // RequiredNpcOrGo names a kill-credit entry that is never spawned
+            // and nothing in the DB links it to a castable creature.
             // Sampled 1/50: this path has no ForceToWait, so it is reached on
             // every AI tick and would otherwise flood the log.
             if (!urand(0, 49))
-                LOG_ERROR("playerbots", "QUESTITEM no-unit s50 bot={} item={} spell={} needed={} scanned={}",
+                LOG_ERROR("playerbots", "QUESTITEM no-unit s50 bot={} item={} spell={} needed={} cond={} scanned={}",
                           bot->GetName(), itemEntry, useSpellId,
-                          neededCreatureEntries.size(), nearbyUnits.size());
+                          targetEntries.size(), allowedTargets.empty() ? 0 : 1, nearbyUnits.size());
             continue;
         }
 
