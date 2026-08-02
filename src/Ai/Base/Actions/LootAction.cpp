@@ -147,10 +147,9 @@ bool OpenLootAction::DoLoot(LootObject& lootObject)
     if (go && (go->GetGoState() != GO_STATE_READY))
         return false;
 
-    // Block event-gated chests (Tribunal Chest, Gunship Armory) but allow
-    // wild quest GOs (Moonpetal Lily etc.) when the bot is on the quest.
-    // isNeededQuestItem only covers GOs listed in gameobject_questitem; ask the
-    // server itself for the rest, the way it answers a real client (PR #2579).
+    // This prevents dungeon chests like Tribunal Chest (Halls of Stone) from being ninja'd by the bots.
+    // Quest objects carry the same flag but are gated on quest state, which ActivateToQuest answers
+    // (upstream #2579). isNeededQuestItem is our extra term — see LootObjectStack::IsLootPossible.
     if (go && go->HasFlag(GAMEOBJECT_FLAGS, GO_FLAG_INTERACT_COND) && !lootObject.isNeededQuestItem &&
         !go->ActivateToQuest(bot))
         return false;

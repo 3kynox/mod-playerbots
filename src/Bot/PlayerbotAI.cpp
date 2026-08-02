@@ -1643,7 +1643,7 @@ void PlayerbotAI::ApplyInstanceStrategies(uint32 mapId, bool tellMaster)
         "aq20", "blacktemple", "bwl", "gruulslair", "hyjal", "icc", "karazhan",
         "magtheridon", "moltencore", "naxx", "onyxia", "rs", "ssc", "tbc-ac", "tempestkeep",
         "ulduar", "voa", "wotlk-an", "wotlk-cos", "wotlk-dtk", "wotlk-eoe", "wotlk-fos",
-        "wotlk-gd", "wotlk-hol", "wotlk-hor", "wotlk-hos", "wotlk-nex", "wotlk-occ",
+        "wotlk-gd", "wotlk-hol", "wotlk-hos", "wotlk-nex", "wotlk-occ",
         "wotlk-ok", "wotlk-os", "wotlk-pos", "wotlk-toc", "wotlk-uk", "wotlk-up",
         "wotlk-vh", "zulaman"
     };
@@ -1758,9 +1758,6 @@ void PlayerbotAI::ApplyInstanceStrategies(uint32 mapId, bool tellMaster)
             break;
         case 658:
             strategyName = "wotlk-pos";  // Pit of Saron
-            break;
-        case 668:
-            strategyName = "wotlk-hor";  // Halls of Reflection
             break;
         case 724:
             strategyName = "rs";  // Ruby Sanctum
@@ -6790,7 +6787,7 @@ float PlayerbotAI::GetItemScoreMultiplier(ItemQualities quality)
     return 1.0f;
 }
 
-bool PlayerbotAI::IsHealingSpell(uint32 spellFamilyName, flag96 spellFalimyFlags)
+bool PlayerbotAI::IsHealingSpell(uint32 spellFamilyName, flag96 spellFamilyFlags)
 {
     if (!spellFamilyName)
         return false;
@@ -6835,7 +6832,7 @@ bool PlayerbotAI::IsHealingSpell(uint32 spellFamilyName, flag96 spellFalimyFlags
         default:
             break;
     }
-    return spellFalimyFlags & healingFlags;
+    return spellFamilyFlags & healingFlags;
 }
 
 SpellFamilyNames PlayerbotAI::Class2SpellFamilyName(uint8 cls)

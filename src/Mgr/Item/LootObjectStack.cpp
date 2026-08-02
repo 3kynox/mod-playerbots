@@ -366,8 +366,12 @@ bool LootObject::IsLootPossible(Player* bot)
     GameObject* go = botAI->GetGameObject(guid);
     if (go && (go->HasFlag(GAMEOBJECT_FLAGS, GO_FLAG_NOT_SELECTABLE) || !go->isSpawned()))
         return false;
-    // isNeededQuestItem only covers GOs listed in gameobject_questitem; ask the
-    // server itself for the rest, the way it answers a real client (PR #2579).
+
+    // Conditional objects (quest chests, goobers, ...) are gated client-side on quest state.
+    // A bot has no client, so make the same call the server makes for one (upstream #2579).
+    // We keep one extra term upstream does not have: isNeededQuestItem, fed from
+    // gameobject_questitem, covers GOs ActivateToQuest answers no for while the bot does need
+    // the item. Dropping it re-blocks the loots BUG-TC9-062 measured back to zero rejections.
     if (go && go->HasFlag(GAMEOBJECT_FLAGS, GO_FLAG_INTERACT_COND) && !isNeededQuestItem &&
         !go->ActivateToQuest(bot))
         return false;
