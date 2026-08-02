@@ -6,8 +6,10 @@
 
 #include "NewRpgAction.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
+#include <numeric>
 
 #include "AreaDefines.h"
 #include "BroadcastHelper.h"
@@ -418,7 +420,25 @@ bool NewRpgDoQuestAction::DoIncompleteQuest(NewRpgInfo::DoQuest& data)
             botAI->rpgInfo.ChangeToIdle();
             return true;
         }
-        uint32 rndIdx = urand(0, poiInfo.size() - 1);
+        // Upstream drew this POI uniformly at random, so a quest with several POIs kept
+        // sending the bot back to the one it had just left — the endless back-and-forth on
+        // collection quests. Take the closest one instead, but keep a small chance to skip
+        // to the next: cmangos/playerbots partitions destinations by distance and skips a
+        // band with the same intent, so bots do not all pile onto the same spot.
+        std::vector<size_t> byDistance(poiInfo.size());
+        std::iota(byDistance.begin(), byDistance.end(), 0);
+        std::sort(byDistance.begin(), byDistance.end(),
+                  [this, &poiInfo](size_t l, size_t r)
+                  {
+                      return bot->GetExactDist2d(poiInfo[l].pos.x, poiInfo[l].pos.y) <
+                             bot->GetExactDist2d(poiInfo[r].pos.x, poiInfo[r].pos.y);
+                  });
+
+        size_t rank = 0;
+        while (rank + 1 < byDistance.size() && !urand(0, 10))
+            ++rank;
+
+        uint32 rndIdx = byDistance[rank];
         G3D::Vector2 nearestPoi = poiInfo[rndIdx].pos;
         int32 objectiveIdx = poiInfo[rndIdx].objectiveIdx;
 

@@ -49,6 +49,7 @@ protected:
     bool IsWithinInteractionDist(Object* object);
     uint32 BestRewardIndex(Quest const* quest);
     bool IsQuestWorthDoing(Quest const* quest);
+    bool HasQuestProgress(uint32 questId);
     bool IsQuestCapableDoing(Quest const* quest);
 
     /* QUEST RELATED ACTION */

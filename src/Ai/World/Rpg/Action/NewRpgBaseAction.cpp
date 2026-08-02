@@ -540,6 +540,30 @@ bool NewRpgBaseAction::IsQuestWorthDoing(Quest const* quest)
     return true;
 }
 
+// True as soon as one objective counter has moved. Lets the quest draw favour a quest the
+// bot already put work into, rather than treating 5/8 and 0/8 as equally attractive.
+bool NewRpgBaseAction::HasQuestProgress(uint32 questId)
+{
+    Quest const* quest = sObjectMgr->GetQuestTemplate(questId);
+    if (!quest || bot->GetQuestStatus(questId) != QUEST_STATUS_INCOMPLETE)
+        return false;
+
+    auto itr = bot->getQuestStatusMap().find(questId);
+    if (itr == bot->getQuestStatusMap().end())
+        return false;
+
+    QuestStatusData const& qs = itr->second;
+    for (int i = 0; i < QUEST_OBJECTIVES_COUNT; ++i)
+        if (quest->RequiredNpcOrGoCount[i] && qs.CreatureOrGOCount[i])
+            return true;
+
+    for (int i = 0; i < QUEST_ITEM_OBJECTIVES_COUNT; ++i)
+        if (quest->RequiredItemCount[i] && qs.ItemCount[i])
+            return true;
+
+    return false;
+}
+
 bool NewRpgBaseAction::IsQuestCapableDoing(Quest const* quest)
 {
     bool highLevelQuest = bot->GetLevel() + 3 < bot->GetQuestLevel(quest);
@@ -1874,6 +1898,9 @@ bool NewRpgBaseAction::RandomChangeStatus(std::vector<NewRpgStatus> candidateSta
         case RPG_DO_QUEST:
         {
             std::vector<uint32> availableQuests;
+            // Quests the bot already put work into. Drawing from the whole log makes it
+            // walk away from a quest at 5/8 for one it never started, so those come first.
+            std::vector<uint32> startedQuests;
             for (uint8 slot = 0; slot < MAX_QUEST_LOG_SIZE; ++slot)
             {
                 uint32 questId = bot->GetQuestSlotQuestId(slot);
@@ -1884,11 +1911,14 @@ bool NewRpgBaseAction::RandomChangeStatus(std::vector<NewRpgStatus> candidateSta
                 if (GetQuestPOIPosAndObjectiveIdx(questId, poiInfo, true))
                 {
                     availableQuests.push_back(questId);
+                    if (HasQuestProgress(questId))
+                        startedQuests.push_back(questId);
                 }
             }
-            if (availableQuests.size())
+            std::vector<uint32> const& pool = startedQuests.empty() ? availableQuests : startedQuests;
+            if (pool.size())
             {
-                uint32 questId = availableQuests[urand(0, availableQuests.size() - 1)];
+                uint32 questId = pool[urand(0, pool.size() - 1)];
                 const Quest* quest = sObjectMgr->GetQuestTemplate(questId);
                 if (quest)
                 {
