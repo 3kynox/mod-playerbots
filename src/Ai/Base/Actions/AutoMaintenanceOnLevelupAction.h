@@ -22,6 +22,7 @@ public:
     bool Execute(Event event);
 
 protected:
+    bool ActsAsRandomBot();
     void AutoTeleportForLevel();
     void AutoPickTalents();
     void AutoLearnSpell();

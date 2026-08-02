@@ -36,9 +36,17 @@ void AutoMaintenanceOnLevelupAction::AutoTeleportForLevel()
     return;
 }
 
+// A selfbot promoted to random-bot semantics never passes IsRandomBot(), so it used to reach the
+// next level with none of the spells and talents that level unlocked, until the 2h-24h maintenance
+// tick came around. Equipment and consumables are deliberately left to that tick.
+bool AutoMaintenanceOnLevelupAction::ActsAsRandomBot()
+{
+    return sRandomPlayerbotMgr.IsRandomBot(bot) || botAI->ActsAsRandomBot();
+}
+
 void AutoMaintenanceOnLevelupAction::AutoPickTalents()
 {
-    if (!sPlayerbotAIConfig.autoPickTalents || !sRandomPlayerbotMgr.IsRandomBot(bot))
+    if (!sPlayerbotAIConfig.autoPickTalents || !ActsAsRandomBot())
         return;
 
     if (bot->GetFreeTalentPoints() <= 0)
@@ -70,10 +78,10 @@ void AutoMaintenanceOnLevelupAction::AutoLearnSpell()
 void AutoMaintenanceOnLevelupAction::LearnSpells(std::ostringstream* out)
 {
     BroadcastHelper::BroadcastLevelup(botAI, bot);
-    if (sPlayerbotAIConfig.autoLearnTrainerSpells && sRandomPlayerbotMgr.IsRandomBot(bot))
+    if (sPlayerbotAIConfig.autoLearnTrainerSpells && ActsAsRandomBot())
         LearnTrainerSpells(out);
 
-    if (sPlayerbotAIConfig.autoLearnQuestSpells && sRandomPlayerbotMgr.IsRandomBot(bot))
+    if (sPlayerbotAIConfig.autoLearnQuestSpells && ActsAsRandomBot())
         LearnQuestSpells(out);
 }
 
