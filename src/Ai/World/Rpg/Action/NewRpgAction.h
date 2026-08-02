@@ -59,6 +59,15 @@ protected:
     const int32 statusDoQuestDuration = 30 * MINUTE  * IN_MILLISECONDS;
     const int32 statusOutDoorPvPDuration = HOUR * IN_MILLISECONDS;
     const int32 statusTravelFlightDuration = 10 * MINUTE * IN_MILLISECONDS;
+    // GO_GRIND and GO_CAMP used to be the only statuses with no time-based
+    // exit: they ended only on arrival within 10y of the target position.
+    // "attack anything" (4.0) outranks "new rpg go grind"/"go camp" (3.0), so
+    // in a mob-dense area the movement action — which also carries the
+    // quest turn-in scan — rarely gets its turn and arrival can take many
+    // minutes. Bound it like every other status so the bot returns to IDLE,
+    // where the quest-focus pick can send it to hand in what it finished.
+    const int32 statusGoGrindDuration = 5 * MINUTE * IN_MILLISECONDS;
+    const int32 statusGoCampDuration = 5 * MINUTE * IN_MILLISECONDS;
 };
 
 class NewRpgGoGrindAction : public NewRpgBaseAction

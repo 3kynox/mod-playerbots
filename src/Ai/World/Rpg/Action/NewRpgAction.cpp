@@ -83,6 +83,12 @@ bool NewRpgStatusUpdateAction::Execute(Event /*event*/)
                 info.ChangeToWanderRandom();
                 return true;
             }
+            // GO_GRIND -> IDLE: never arrived in time (see statusGoGrindDuration)
+            if (info.HasStatusPersisted(statusGoGrindDuration))
+            {
+                info.ChangeToIdle();
+                return true;
+            }
             break;
         }
         case RPG_GO_CAMP:
@@ -94,6 +100,12 @@ bool NewRpgStatusUpdateAction::Execute(Event /*event*/)
             if (bot->GetExactDist(originalPos) < 10.0f)
             {
                 info.ChangeToWanderNpc();
+                return true;
+            }
+            // GO_CAMP -> IDLE: never arrived in time (see statusGoCampDuration)
+            if (info.HasStatusPersisted(statusGoCampDuration))
+            {
+                info.ChangeToIdle();
                 return true;
             }
             break;
@@ -499,7 +511,10 @@ bool NewRpgDoQuestAction::DoIncompleteQuest(NewRpgInfo::DoQuest& data)
             /// @TODO: It may be better to make lowPriorityQuest a global set shared by all bots (or saved in db)
             botAI->lowPriorityQuest.insert(questId);
             botAI->rpgStatistic.questAbandoned++;
-            LOG_DEBUG("playerbots", "[New RPG] {} marked as abandoned quest {}", bot->GetName(), questId);
+            // Same INFO shape as the pursuit watchdog: an abandon that leaves no
+            // trace is undiagnosable, and DEBUG is off on a live server.
+            LOG_INFO("playerbots", "QUESTABANDON ts={} bot={} quest={} secs={} reason=poi-no-progress",
+                     uint32(time(nullptr)), bot->GetName(), questId, poiStayTime / 1000);
             botAI->rpgInfo.ChangeToIdle();
             return true;
         }
@@ -716,7 +731,8 @@ bool NewRpgDoQuestAction::DoCompletedQuest(NewRpgInfo::DoQuest& data)
         /// @TODO: It may be better to make lowPriorityQuest a global set shared by all bots (or saved in db)
         botAI->lowPriorityQuest.insert(questId);
         botAI->rpgStatistic.questAbandoned++;
-        LOG_DEBUG("playerbots", "[New RPG] {} marked as abandoned quest {}", bot->GetName(), questId);
+        LOG_INFO("playerbots", "QUESTABANDON ts={} bot={} quest={} secs={} reason=turnin-npc-not-found",
+                 uint32(time(nullptr)), bot->GetName(), questId, poiStayTime / 1000);
         botAI->rpgInfo.ChangeToIdle();
         return true;
     }
