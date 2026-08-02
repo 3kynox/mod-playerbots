@@ -11,6 +11,7 @@
 #include <sstream>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 
 #include "BroadcastHelper.h"
 #include "CellImpl.h"
@@ -1897,10 +1898,13 @@ bool NewRpgBaseAction::RandomChangeStatus(std::vector<NewRpgStatus> candidateSta
         }
         case RPG_DO_QUEST:
         {
-            std::vector<uint32> availableQuests;
-            // Quests the bot already put work into. Drawing from the whole log makes it
-            // walk away from a quest at 5/8 for one it never started, so those come first.
-            std::vector<uint32> startedQuests;
+            // Each candidate carries the distance to its closest POI, so the draw can prefer
+            // what is under the bot's feet. Quests it already put work into come first: a
+            // uniform draw over the whole log walks away from a quest at 5/8 for one never
+            // started, and ignores that the first is thirty yards away and the second seven
+            // hundred.
+            std::vector<std::pair<uint32, float>> availableQuests;
+            std::vector<std::pair<uint32, float>> startedQuests;
             for (uint8 slot = 0; slot < MAX_QUEST_LOG_SIZE; ++slot)
             {
                 uint32 questId = bot->GetQuestSlotQuestId(slot);
@@ -1910,15 +1914,28 @@ bool NewRpgBaseAction::RandomChangeStatus(std::vector<NewRpgStatus> candidateSta
                 std::vector<POIInfo> poiInfo;
                 if (GetQuestPOIPosAndObjectiveIdx(questId, poiInfo, true))
                 {
-                    availableQuests.push_back(questId);
+                    float nearestPoiDist = std::numeric_limits<float>::max();
+                    for (POIInfo const& poi : poiInfo)
+                        nearestPoiDist = std::min(nearestPoiDist, bot->GetExactDist2d(poi.pos.x, poi.pos.y));
+
+                    availableQuests.emplace_back(questId, nearestPoiDist);
                     if (HasQuestProgress(questId))
-                        startedQuests.push_back(questId);
+                        startedQuests.emplace_back(questId, nearestPoiDist);
                 }
             }
-            std::vector<uint32> const& pool = startedQuests.empty() ? availableQuests : startedQuests;
+            auto& pool = startedQuests.empty() ? availableQuests : startedQuests;
             if (pool.size())
             {
-                uint32 questId = pool[urand(0, pool.size() - 1)];
+                std::sort(pool.begin(), pool.end(),
+                          [](std::pair<uint32, float> const& l, std::pair<uint32, float> const& r)
+                          { return l.second < r.second; });
+
+                // Same escape valve as the POI draw, so bots do not all converge on one quest.
+                size_t rank = 0;
+                while (rank + 1 < pool.size() && !urand(0, 10))
+                    ++rank;
+
+                uint32 questId = pool[rank].first;
                 const Quest* quest = sObjectMgr->GetQuestTemplate(questId);
                 if (quest)
                 {
