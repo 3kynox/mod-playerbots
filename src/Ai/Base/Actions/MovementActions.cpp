@@ -2002,7 +2002,13 @@ void MovementAction::DoMovePoint(Unit* unit, float x, float y, float z, bool gen
 
 bool FleeAction::Execute(Event /*event*/)
 {
-    return MoveAway(AI_VALUE(Unit*, "current target"), sPlayerbotAIConfig.fleeDistance, true);
+    // Backpedalling uses MOVE_RUN_BACK: 4.5 yards/s against the 7.0 of anything chasing the
+    // bot. Breaking contact that way is arithmetically impossible -- the attacker stays in
+    // melee for the whole retreat, and the bot, never turning, drags its aggro through
+    // everything on the path. Retreating face-forward at least runs at the same speed as
+    // the pursuer. Keeping the target in front while stepping out of melee is a different
+    // job, and it already has its own action (MoveOutOfEnemyContactAction).
+    return MoveAway(AI_VALUE(Unit*, "current target"), sPlayerbotAIConfig.fleeDistance, false);
 }
 
 bool FleeAction::isUseful()
