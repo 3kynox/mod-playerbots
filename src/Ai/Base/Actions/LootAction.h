@@ -32,6 +32,7 @@ public:
     bool Execute(Event event) override;
 
 private:
+    void TraceLootFailure(LootObject const& lootObject, char const* reason);
     bool DoLoot(LootObject& lootObject);
     uint32 GetOpeningSpell(LootObject& lootObject);
     uint32 GetOpeningSpell(LootObject& lootObject, GameObject* go);

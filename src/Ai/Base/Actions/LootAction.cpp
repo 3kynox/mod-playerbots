@@ -90,6 +90,23 @@ bool OpenLootAction::Execute(Event /*event*/)
     return result;
 }
 
+// Sess 69: a played character reported "ability is not available" and "out of range" while
+// standing next to what it was looting, and nothing said which gate rejected it. Trace the
+// exact path — played characters only, random bots would flood the log.
+void OpenLootAction::TraceLootFailure(LootObject const& lootObject, char const* reason)
+{
+    if (!botAI->IsRealPlayer())
+        return;
+
+    WorldObject* obj = botAI->GetCreature(lootObject.guid)
+                           ? static_cast<WorldObject*>(botAI->GetCreature(lootObject.guid))
+                           : static_cast<WorldObject*>(botAI->GetGameObject(lootObject.guid));
+
+    LOG_INFO("playerbots", "LOOTFAIL ts={} bot={} guid={} skill={} dist={} moving={} reason={}",
+             uint32(time(nullptr)), bot->GetName(), lootObject.guid.GetCounter(),
+             uint32(lootObject.skillId), obj ? bot->GetDistance(obj) : -1.0f, bot->isMoving(), reason);
+}
+
 bool OpenLootAction::DoLoot(LootObject& lootObject)
 {
     if (lootObject.IsEmpty())
@@ -97,7 +114,10 @@ bool OpenLootAction::DoLoot(LootObject& lootObject)
 
     Creature* creature = botAI->GetCreature(lootObject.guid);
     if (creature && bot->GetDistance(creature) > INTERACTION_DISTANCE - 2.0f)
+    {
+        TraceLootFailure(lootObject, "creature-out-of-range");
         return false;
+    }
 
     // Dismount if the bot is mounted
     if (bot->IsMounted())
@@ -125,27 +145,44 @@ bool OpenLootAction::DoLoot(LootObject& lootObject)
     {
         SkillType skill = creature->GetCreatureTemplate()->GetRequiredLootSkill();
         if (!CanOpenLock(skill, lootObject.reqSkillValue))
+        {
+            TraceLootFailure(lootObject, "creature-lock");
             return false;
+        }
 
+        bool cast = false;
         switch (skill)
         {
             case SKILL_ENGINEERING:
-                return botAI->HasSkill(SKILL_ENGINEERING) ? botAI->CastSpell(ENGINEERING, creature) : false;
+                cast = botAI->HasSkill(SKILL_ENGINEERING) && botAI->CastSpell(ENGINEERING, creature);
+                break;
             case SKILL_HERBALISM:
-                return botAI->HasSkill(SKILL_HERBALISM) ? botAI->CastSpell(32605, creature) : false;
+                cast = botAI->HasSkill(SKILL_HERBALISM) && botAI->CastSpell(32605, creature);
+                break;
             case SKILL_MINING:
-                return botAI->HasSkill(SKILL_MINING) ? botAI->CastSpell(32606, creature) : false;
+                cast = botAI->HasSkill(SKILL_MINING) && botAI->CastSpell(32606, creature);
+                break;
             default:
-                return botAI->HasSkill(SKILL_SKINNING) ? botAI->CastSpell(SKINNING, creature) : false;
+                cast = botAI->HasSkill(SKILL_SKINNING) && botAI->CastSpell(SKINNING, creature);
+                break;
         }
+        if (!cast)
+            TraceLootFailure(lootObject, "creature-skill-cast");
+        return cast;
     }
 
     GameObject* go = botAI->GetGameObject(lootObject.guid);
     if (go && bot->GetDistance(go) > INTERACTION_DISTANCE - 2.0f)
+    {
+        TraceLootFailure(lootObject, "go-out-of-range");
         return false;
+    }
 
     if (go && (go->GetGoState() != GO_STATE_READY))
+    {
+        TraceLootFailure(lootObject, "go-not-ready");
         return false;
+    }
 
     // This prevents dungeon chests like Tribunal Chest (Halls of Stone) from being ninja'd by the bots.
     // Quest objects carry the same flag but are gated on quest state, which ActivateToQuest answers
@@ -159,16 +196,32 @@ bool OpenLootAction::DoLoot(LootObject& lootObject)
         return false;
 
     if (lootObject.skillId == SKILL_MINING)
-        return botAI->HasSkill(SKILL_MINING) ? botAI->CastSpell(MINING, bot) : false;
+    {
+        bool cast = botAI->HasSkill(SKILL_MINING) && botAI->CastSpell(MINING, bot);
+        if (!cast)
+            TraceLootFailure(lootObject, "mining-cast");
+        return cast;
+    }
 
     if (lootObject.skillId == SKILL_HERBALISM)
-        return botAI->HasSkill(SKILL_HERBALISM) ? botAI->CastSpell(HERB_GATHERING, bot) : false;
+    {
+        bool cast = botAI->HasSkill(SKILL_HERBALISM) && botAI->CastSpell(HERB_GATHERING, bot);
+        if (!cast)
+            TraceLootFailure(lootObject, "herbalism-cast");
+        return cast;
+    }
 
     uint32 spellId = GetOpeningSpell(lootObject);
     if (!spellId)
+    {
+        TraceLootFailure(lootObject, "no-opening-spell");
         return false;
+    }
 
-    return botAI->CastSpell(spellId, bot);
+    bool cast = botAI->CastSpell(spellId, bot);
+    if (!cast)
+        TraceLootFailure(lootObject, "opening-cast");
+    return cast;
 }
 
 uint32 OpenLootAction::GetOpeningSpell(LootObject& lootObject)
