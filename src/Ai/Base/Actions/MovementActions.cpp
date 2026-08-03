@@ -2008,7 +2008,76 @@ bool FleeAction::Execute(Event /*event*/)
     // everything on the path. Retreating face-forward at least runs at the same speed as
     // the pursuer. Keeping the target in front while stepping out of melee is a different
     // job, and it already has its own action (MoveOutOfEnemyContactAction).
-    return MoveAway(AI_VALUE(Unit*, "current target"), sPlayerbotAIConfig.fleeDistance, false);
+    Unit* target = AI_VALUE(Unit*, "current target");
+    if (!target)
+        return false;
+
+    // Straight away from the attacker is not the same as away from danger. In a mine
+    // corridor the opposite direction points deeper in, so the bot flees into the mobs it
+    // had not pulled yet and dies with a bigger pack than it started with -- observed in
+    // Fargodeep Mine. Score each candidate by its total distance to every hostile that can
+    // see it and keep the best one, which is what cmangos/playerbots does in FleeManager.
+    float const distance = sPlayerbotAIConfig.fleeDistance;
+    float const initAngle = target->GetAngle(bot);
+
+    GuidVector hostiles = AI_VALUE(GuidVector, "possible targets no los");
+    float bestScore = -1.0f;
+    float bestX = 0.0f, bestY = 0.0f, bestZ = 0.0f;
+    bool bestExact = true;
+
+    for (float delta = 0; delta <= M_PI / 2; delta += M_PI / 8)
+    {
+        for (int8 sign = 1; sign >= -1; sign -= 2)
+        {
+            if (delta == 0 && sign < 0)
+                continue;
+
+            float const angle = initAngle + sign * delta;
+            float x = bot->GetPositionX() + cos(angle) * distance;
+            float y = bot->GetPositionY() + sin(angle) * distance;
+            float z = bot->GetPositionZ();
+            bool exact = bot->GetMap()->CheckCollisionAndGetValidCoords(bot, bot->GetPositionX(),
+                                                                       bot->GetPositionY(),
+                                                                       bot->GetPositionZ(), x, y, z);
+            if (!exact)
+            {
+                x = bot->GetPositionX() + cos(angle) * distance;
+                y = bot->GetPositionY() + sin(angle) * distance;
+                z = bot->GetPositionZ();
+            }
+
+            // Sum, not minimum: one nearby attacker must not outweigh running into six.
+            float score = 0.0f;
+            for (ObjectGuid const& guid : hostiles)
+            {
+                Unit* unit = botAI->GetUnit(guid);
+                if (!unit || !unit->IsAlive())
+                    continue;
+
+                // A mob that cannot see the destination is not a threat there.
+                if (!unit->IsWithinLOS(x, y, z + unit->GetCollisionHeight()))
+                    continue;
+
+                score += unit->GetExactDist2d(x, y);
+            }
+
+            if (score > bestScore)
+            {
+                bestScore = score;
+                bestX = x;
+                bestY = y;
+                bestZ = z;
+                bestExact = exact;
+            }
+        }
+    }
+
+    if (bestScore >= 0.0f && MoveTo(target->GetMapId(), bestX, bestY, bestZ, false, false, true, bestExact,
+                                    MovementPriority::MOVEMENT_COMBAT, false, false))
+        return true;
+
+    // No candidate was reachable: fall back to the plain "opposite the attacker" sweep.
+    return MoveAway(target, distance, false);
 }
 
 bool FleeAction::isUseful()
