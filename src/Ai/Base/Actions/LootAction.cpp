@@ -107,6 +107,18 @@ void OpenLootAction::TraceLootFailure(LootObject const& lootObject, char const* 
              uint32(lootObject.skillId), obj ? bot->GetDistance(obj) : -1.0f, bot->isMoving(), reason);
 }
 
+void OpenLootAction::TraceLootQueued(LootObject const& lootObject)
+{
+    if (!botAI->IsRealPlayer())
+        return;
+
+    Creature* creature = botAI->GetCreature(lootObject.guid);
+
+    LOG_INFO("playerbots", "LOOTQUEUE ts={} bot={} guid={} dist={} moving={} sitting={}",
+             uint32(time(nullptr)), bot->GetName(), lootObject.guid.GetCounter(),
+             creature ? bot->GetDistance(creature) : -1.0f, bot->isMoving(), !bot->IsStandState());
+}
+
 void OpenLootAction::TraceLootCastSent(LootObject const& lootObject, uint32 spellId)
 {
     if (!botAI->IsRealPlayer())
@@ -145,6 +157,11 @@ bool OpenLootAction::DoLoot(LootObject& lootObject)
         *packet << lootObject.guid;
         bot->GetSession()->QueuePacket(packet);
         // bot->GetSession()->HandleLootOpcode(packet);
+        // The packet is queued, not handled: the server re-checks the range a tick or more
+        // later, by which time the bot may have moved or sat down to eat, and answers "out
+        // of range" to the player while this returns true regardless. Corpse looting was
+        // the one path with no trace at all.
+        TraceLootQueued(lootObject);
         botAI->SetNextCheckDelay(sPlayerbotAIConfig.lootDelay);
         return true;
     }
@@ -160,6 +177,10 @@ bool OpenLootAction::DoLoot(LootObject& lootObject)
         // order between two loot ticks, so the bot paces in front of the object forever
         // and the log stays empty -- exactly what the earlier isMoving() fix produced.
         TraceLootFailure(lootObject, "moving-wait");
+        // That something is the movement generator: StopMoving() ends the spline but
+        // leaves the generator in place, which immediately issues movement again. Same
+        // root cause upstream PR #2607 found breaking the seated aura when a bot eats.
+        bot->GetMotionMaster()->Clear(false);
         bot->StopMoving();
         botAI->SetNextCheckDelay(sPlayerbotAIConfig.lootDelay);
         return false;

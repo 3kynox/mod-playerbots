@@ -36,6 +36,8 @@ private:
     // The opening spell was accepted by the server. Paired with LOOTFAIL it tells apart
     // "the bot never casts" from "the bot casts and the object still yields nothing".
     void TraceLootCastSent(LootObject const& lootObject, uint32 spellId);
+    // Corpse looting queues CMSG_LOOT and returns true whatever the server then answers.
+    void TraceLootQueued(LootObject const& lootObject);
     bool DoLoot(LootObject& lootObject);
     uint32 GetOpeningSpell(LootObject& lootObject);
     uint32 GetOpeningSpell(LootObject& lootObject, GameObject* go);
