@@ -21,9 +21,17 @@ constexpr uint32 SPELL_SPRINT_RANK_1 = 2983;
 //     return !botAI->HasAura("stealth", bot);
 // }
 
+static bool HostileWithinAggroRange(PlayerbotAI* botAI, Player* bot);
+
 bool UnstealthTrigger::IsActive()
 {
     if (!botAI->HasAura("stealth", bot))
+        return false;
+
+    // Keep the stealth while something can still pull us: "nc" runs this every non-combat
+    // tick at relevance 30 and would undo the approach stealth immediately, since a bot
+    // walking to a POI is by definition moving and unattacked.
+    if (HostileWithinAggroRange(botAI, bot))
         return false;
 
     return botAI->HasAura("stealth", bot) && !AI_VALUE(uint8, "attacker count") &&
@@ -33,6 +41,38 @@ bool UnstealthTrigger::IsActive()
               AI_VALUE2(bool, "moving", "group leader")) ||
              !AI_VALUE(uint8, "attacker count")));
 }
+
+// True when a hostile is close enough to be about to pull us. The radius is the server's own
+// aggro formula (Creature::GetAttackDistance): 20 yards at equal level, one yard per level of
+// difference, floored at 5 and scaled by Rate.Creature.Aggro -- so it adapts on its own instead
+// of carrying a hardcoded distance that would be wrong for every other level gap.
+//
+// Shared by StealthTrigger and UnstealthTrigger on purpose: "nc" is loaded on every rogue's
+// non-combat engine and unstealths at relevance 30 whenever the bot is moving and unattacked,
+// which would strip the stealth back off on the very next tick.
+static bool HostileWithinAggroRange(PlayerbotAI* botAI, Player* bot)
+{
+    if (bot->IsMounted() || bot->IsInCombat())
+        return false;
+
+    GuidVector hostiles = botAI->GetAiObjectContext()->GetValue<GuidVector>("possible targets")->Get();
+    for (ObjectGuid const& guid : hostiles)
+    {
+        Creature* creature = botAI->GetCreature(guid);
+        if (!creature || !creature->IsAlive())
+            continue;
+
+        // A margin so the spell goes off before we are inside the radius rather than as the
+        // mob is already turning around.
+        float const aggroRadius = creature->GetAttackDistance(bot) + 8.0f;
+        if (bot->GetExactDist2d(creature) <= aggroRadius)
+            return true;
+    }
+
+    return false;
+}
+
+bool StealthTrigger::ShouldStealthApproach() { return HostileWithinAggroRange(botAI, bot); }
 
 bool StealthTrigger::IsActive()
 {
@@ -51,6 +91,15 @@ bool StealthTrigger::IsActive()
 
     if (!target)
         target = AI_VALUE(Unit*, "dps target");
+
+    // No designated target means the bot is travelling -- to a quest POI, most of the time --
+    // and every branch above has already returned false, so a rogue never stealthed on the
+    // way anywhere. It walked into camps at full speed and arrived with two to four mobs on
+    // it. Stealth when something is about to notice us instead, whatever the reason for
+    // being here: keying this on the quest objective type would break as soon as a quest
+    // asks to both kill and collect, and there are plenty of those.
+    if (!target)
+        return ShouldStealthApproach();
 
     if (!target)
         return false;

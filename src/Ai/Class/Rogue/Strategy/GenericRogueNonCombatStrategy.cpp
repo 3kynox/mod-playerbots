@@ -48,4 +48,11 @@ void GenericRogueNonCombatStrategy::InitTriggers(std::vector<TriggerNode*>& trig
                         { NextAction("use deadly poison on off hand", 19.0f) }));
 
     triggers.push_back(new TriggerNode("often", { NextAction("unstealth", 30.0f) }));
+
+    // Out of combat a rogue had no way to stealth at all: the only path to the action lives
+    // in the combat strategy "dps", behind "enemy out of melee", so it needed a designated
+    // target. Travelling to a quest POI has none, so the bot crossed camps at a run and
+    // arrived with several mobs on it. The trigger fires on proximity to anything hostile,
+    // and holds the stealth as long as one is in range -- above unstealth, which sits at 30.
+    triggers.push_back(new TriggerNode("stealth", { NextAction("stealth", 31.0f) }));
 }
