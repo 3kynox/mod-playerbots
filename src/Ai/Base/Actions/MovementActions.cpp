@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 #include <string>
 
@@ -2012,6 +2013,15 @@ bool FleeAction::Execute(Event /*event*/)
     if (!target)
         return false;
 
+    // A retreat already under way is kept. The direction is decided once, at the first tick
+    // of the flight, and held until the bot arrives or the retreat times out. Recomputing it
+    // every tick made the bot pick a direction, stop, pick another, stop again: the score
+    // moves with the bot, so the destination kept sliding and every new MoveTo cut the
+    // previous spline. A retreat that stutters is a retreat that never breaks contact.
+    time_t const now = time(nullptr);
+    if (now < fleeUntil && bot->GetExactDist2d(fleeX, fleeY) > 3.0f)
+        return true;
+
     // Straight away from the attacker is not the same as away from danger. In a mine
     // corridor the opposite direction points deeper in, so the bot flees into the mobs it
     // had not pulled yet and dies with a bigger pack than it started with -- observed in
@@ -2021,7 +2031,7 @@ bool FleeAction::Execute(Event /*event*/)
     float const initAngle = target->GetAngle(bot);
 
     GuidVector hostiles = AI_VALUE(GuidVector, "possible targets no los");
-    float bestScore = -1.0f;
+    float bestScore = -std::numeric_limits<float>::max();
     float bestX = 0.0f, bestY = 0.0f, bestZ = 0.0f;
     bool bestExact = true;
 
@@ -2061,6 +2071,12 @@ bool FleeAction::Execute(Event /*event*/)
                 score += unit->GetExactDist2d(x, y);
             }
 
+            // Penalise sideways angles. initAngle points back the way the bot came from --
+            // the ground it has already crossed, hence the ground it knows is clear -- so
+            // the retreat should read as going back, and only bend off that axis when doing
+            // so genuinely avoids more mobs.
+            score -= delta * 30.0f;
+
             if (score > bestScore)
             {
                 bestScore = score;
@@ -2072,9 +2088,16 @@ bool FleeAction::Execute(Event /*event*/)
         }
     }
 
-    if (bestScore >= 0.0f && MoveTo(target->GetMapId(), bestX, bestY, bestZ, false, false, true, bestExact,
-                                    MovementPriority::MOVEMENT_COMBAT, false, false))
+    if (bestScore > -std::numeric_limits<float>::max() &&
+        MoveTo(target->GetMapId(), bestX, bestY, bestZ, false, false, true, bestExact,
+               MovementPriority::MOVEMENT_COMBAT, false, false))
+    {
+        fleeX = bestX;
+        fleeY = bestY;
+        fleeZ = bestZ;
+        fleeUntil = now + 5;
         return true;
+    }
 
     // No candidate was reachable: fall back to the plain "opposite the attacker" sweep.
     return MoveAway(target, distance, false);
@@ -2083,6 +2106,15 @@ bool FleeAction::Execute(Event /*event*/)
 bool FleeAction::isUseful()
 {
     if (bot->GetCurrentSpell(CURRENT_CHANNELED_SPELL) != nullptr)
+        return false;
+
+    // One attacker is a fight, not a rout. OutNumberedTrigger weighs a foe at
+    // max(100 + 10*dLevel, dLevel*200), so a single mob two levels up already scores 400
+    // against a healthy bot's 200 and trips flee on the opening blow -- the bot then runs,
+    // never breaks contact, and dies tired. Above critical health, stand and fight when
+    // only one thing is on us; panic and critical health still have their own triggers.
+    if (AI_VALUE(uint8, "attacker count") <= 1 &&
+        AI_VALUE2(uint8, "health", "self target") > sPlayerbotAIConfig.criticalHealth)
         return false;
 
     Unit* target = AI_VALUE(Unit*, "current target");
