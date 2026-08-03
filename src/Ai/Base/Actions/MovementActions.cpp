@@ -6,6 +6,7 @@
 
 #include "MovementActions.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <iomanip>
@@ -2027,7 +2028,12 @@ bool FleeAction::Execute(Event /*event*/)
     // had not pulled yet and dies with a bigger pack than it started with -- observed in
     // Fargodeep Mine. Score each candidate by its total distance to every hostile that can
     // see it and keep the best one, which is what cmangos/playerbots does in FleeManager.
-    float const distance = sPlayerbotAIConfig.fleeDistance;
+    // AiPlayerbot.FleeDistance defaults to five yards, which is the length of a melee swing:
+    // the bot reached the point in under a second, this function ran again, picked a fresh
+    // direction and set off once more. That is the "run, pause, turn, run" seen in game, and
+    // it is also why fleeing never broke contact -- five yards outruns nothing. Retreat far
+    // enough for the flight to mean something, keeping the configured value as a floor.
+    float const distance = std::max(sPlayerbotAIConfig.fleeDistance, 25.0f);
     float const initAngle = target->GetAngle(bot);
 
     GuidVector hostiles = AI_VALUE(GuidVector, "possible targets no los");

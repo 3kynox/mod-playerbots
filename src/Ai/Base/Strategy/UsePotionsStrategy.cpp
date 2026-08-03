@@ -30,8 +30,13 @@ void UsePotionsStrategy::InitTriggers(std::vector<TriggerNode*>& triggers)
 {
     Strategy::InitTriggers(triggers);
 
+    // Above the flee that PanicTrigger fires at ACTION_EMERGENCY + 9. At 21 against 99 the
+    // potion never got its turn: a bot below critical health ran off with a full stack in its
+    // bag, at the same speed as whatever was chasing it, and died anyway. Drinking is the one
+    // move that changes the outcome, so it is tried first -- and if there is no potion and no
+    // healthstone the action simply fails and flee takes over on the same tick.
     triggers.push_back(new TriggerNode(
-        "critical health", { NextAction("healthstone", ACTION_MEDIUM_HEAL + 1) }));
+        "critical health", { NextAction("healthstone", ACTION_EMERGENCY + 10) }));
     triggers.push_back(
         new TriggerNode("medium mana", { NextAction("mana potion", ACTION_EMERGENCY) }));
 }

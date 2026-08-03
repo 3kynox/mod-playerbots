@@ -7,6 +7,7 @@
 #include "RogueTriggers.h"
 
 #include "GenericTriggers.h"
+#include "LootObjectStack.h"
 #include "Playerbots.h"
 #include "ServerFacade.h"
 
@@ -42,10 +43,20 @@ bool UnstealthTrigger::IsActive()
              !AI_VALUE(uint8, "attacker count")));
 }
 
-// True when a hostile is close enough to be about to pull us. The radius is the server's own
-// aggro formula (Creature::GetAttackDistance): 20 yards at equal level, one yard per level of
-// difference, floored at 5 and scaled by Rate.Creature.Aggro -- so it adapts on its own instead
-// of carrying a hardcoded distance that would be wrong for every other level gap.
+// True when the bot is walking into a *group* of hostiles. The radius is the server's own aggro
+// formula (Creature::GetAttackDistance): 20 yards at equal level, one yard per level of
+// difference, floored at 5, scaled by Rate.Creature.Aggro -- so it adapts on its own instead of
+// carrying a hardcoded distance that would be wrong for every other level gap.
+//
+// Two hostiles, not one, and a small margin. A first attempt fired on any single hostile within
+// the radius plus eight yards -- 31 yards against a mob three levels up -- and in a starting zone
+// something is always within 31 yards, so the bot travelled permanently stealthed, hence
+// permanently slowed. One mob by the roadside is a fight the bot wins; what kills it is the pack,
+// which is the case worth spending the cooldown on.
+//
+// Note it does not make the bot invisible: WorldObject::CanDetectStealthOf gives a level 10 mob
+// roughly twelve yards of detection against a level 7 rogue. Stealth buys a smaller aggro radius,
+// not immunity, and a POI sitting inside a camp will still be contested.
 //
 // Shared by StealthTrigger and UnstealthTrigger on purpose: "nc" is loaded on every rogue's
 // non-combat engine and unstealths at relevance 30 whenever the bot is moving and unattacked,
@@ -55,6 +66,12 @@ static bool HostileWithinAggroRange(PlayerbotAI* botAI, Player* bot)
     if (bot->IsMounted() || bot->IsInCombat())
         return false;
 
+    // Stealth breaks the moment the object is opened, so cloaking to loot only burns the
+    // cooldown and leaves the bot slow on the way in.
+    if (!botAI->GetAiObjectContext()->GetValue<LootObject>("loot target")->Get().IsEmpty())
+        return false;
+
+    uint32 nearby = 0;
     GuidVector hostiles = botAI->GetAiObjectContext()->GetValue<GuidVector>("possible targets")->Get();
     for (ObjectGuid const& guid : hostiles)
     {
@@ -62,10 +79,8 @@ static bool HostileWithinAggroRange(PlayerbotAI* botAI, Player* bot)
         if (!creature || !creature->IsAlive())
             continue;
 
-        // A margin so the spell goes off before we are inside the radius rather than as the
-        // mob is already turning around.
-        float const aggroRadius = creature->GetAttackDistance(bot) + 8.0f;
-        if (bot->GetExactDist2d(creature) <= aggroRadius)
+        float const aggroRadius = creature->GetAttackDistance(bot) + 3.0f;
+        if (bot->GetExactDist2d(creature) <= aggroRadius && ++nearby >= 2)
             return true;
     }
 
@@ -76,7 +91,16 @@ bool StealthTrigger::ShouldStealthApproach() { return HostileWithinAggroRange(bo
 
 bool StealthTrigger::IsActive()
 {
-    if (bot->HasAura(SPELL_STEALTH) || bot->IsInCombat() || bot->HasSpellCooldown(SPELL_STEALTH))
+    // By name, not by SPELL_STEALTH: CastStealthAction casts "stealth" through
+    // CastBuffSpellAction, which resolves to the highest rank the bot knows. Testing rank 1
+    // means that from rank 2 (level 20) on, neither the aura nor the cooldown of the spell
+    // actually cast is seen, and the trigger keeps asking for a stealth already up or still
+    // on cooldown.
+    uint32 stealthSpellId = AI_VALUE2(uint32, "spell id", "stealth");
+    if (!stealthSpellId)
+        stealthSpellId = SPELL_STEALTH;
+    if (botAI->HasAura("stealth", bot) || bot->IsInCombat() ||
+        (stealthSpellId && bot->HasSpellCooldown(stealthSpellId)))
         return false;
 
     float distance = 30.f;

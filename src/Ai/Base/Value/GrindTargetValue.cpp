@@ -142,7 +142,12 @@ Unit* GrindTargetValue::FindTargetForGrinding(uint32 assistCount)
             continue;
         }
 
-        if (!bot->InBattleground() && (int)unit->GetLevel() - (int)bot->GetLevel() > 4 && !unit->GetGUID().IsPlayer())
+        // Was four levels up. A level 7 bot therefore picked fights with level 11 mobs and
+        // lost them: at that gap it is behind on hit chance, on miss and on mitigation all at
+        // once, so the fight is decided before it starts. Reported in game as a level 7 rogue
+        // attacking level 10 wolves and dying to them. Two levels is still a hard fight and
+        // still gives experience; anything beyond that is a target the bot should walk past.
+        if (!bot->InBattleground() && (int)unit->GetLevel() - (int)bot->GetLevel() > 2 && !unit->GetGUID().IsPlayer())
             continue;
 
         if (Creature* creature = unit->ToCreature())
