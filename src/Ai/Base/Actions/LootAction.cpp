@@ -107,6 +107,19 @@ void OpenLootAction::TraceLootFailure(LootObject const& lootObject, char const* 
              uint32(lootObject.skillId), obj ? bot->GetDistance(obj) : -1.0f, bot->isMoving(), reason);
 }
 
+void OpenLootAction::TraceLootCastSent(LootObject const& lootObject, uint32 spellId)
+{
+    if (!botAI->IsRealPlayer())
+        return;
+
+    uint32 goEntry = 0;
+    if (GameObject* go = botAI->GetGameObject(lootObject.guid))
+        goEntry = go->GetEntry();
+
+    LOG_INFO("playerbots", "LOOTCAST ts={} bot={} guid={} goEntry={} spell={}", uint32(time(nullptr)),
+             bot->GetName(), lootObject.guid.GetCounter(), goEntry, spellId);
+}
+
 bool OpenLootAction::DoLoot(LootObject& lootObject)
 {
     if (lootObject.IsEmpty())
@@ -143,6 +156,10 @@ bool OpenLootAction::DoLoot(LootObject& lootObject)
     // isMoving() still true. Stop, then retry on a later tick, standing still.
     if (bot->isMoving())
     {
+        // Traced: without this the retry loop is invisible. Something re-issues a move
+        // order between two loot ticks, so the bot paces in front of the object forever
+        // and the log stays empty -- exactly what the earlier isMoving() fix produced.
+        TraceLootFailure(lootObject, "moving-wait");
         bot->StopMoving();
         botAI->SetNextCheckDelay(sPlayerbotAIConfig.lootDelay);
         return false;
@@ -196,11 +213,17 @@ bool OpenLootAction::DoLoot(LootObject& lootObject)
     // (upstream #2579). isNeededQuestItem is our extra term — see LootObjectStack::IsLootPossible.
     if (go && go->HasFlag(GAMEOBJECT_FLAGS, GO_FLAG_INTERACT_COND) && !lootObject.isNeededQuestItem &&
         !go->ActivateToQuest(bot))
+    {
+        TraceLootFailure(lootObject, "go-interact-cond");
         return false;
+    }
 
     // This prevents raid chests like Gunship Armory (ICC) from being ninja'd by the bots
     if (go && go->HasFlag(GAMEOBJECT_FLAGS, GO_FLAG_NOT_SELECTABLE))
+    {
+        TraceLootFailure(lootObject, "go-not-selectable");
         return false;
+    }
 
     if (lootObject.skillId == SKILL_MINING)
     {
@@ -228,6 +251,8 @@ bool OpenLootAction::DoLoot(LootObject& lootObject)
     bool cast = botAI->CastSpell(spellId, bot);
     if (!cast)
         TraceLootFailure(lootObject, "opening-cast");
+    else
+        TraceLootCastSent(lootObject, spellId);
     return cast;
 }
 
