@@ -3764,6 +3764,12 @@ bool PlayerbotAI::CastSpell(uint32 spellId, Unit* target, Item* itemTarget)
 
     if (result != SPELL_CAST_OK)
     {
+        // LOOTFAIL reason=opening-cast only says prepare() refused, never why. Played
+        // characters only, same reason as the loot traces: random bots would flood it.
+        if (IsRealPlayer())
+            LOG_INFO("playerbots", "CASTFAIL ts={} bot={} spell={} result={}", uint32(time(nullptr)),
+                     bot->GetName(), spellId, uint32(result));
+
         // if (!sPlayerbotAIConfig.logInGroupOnly || (bot->GetGroup() && HasRealPlayerMaster()))
         // {
         //     LOG_DEBUG("playerbots", "Spell cast failed. - target name: {}, spellid: {}, bot name: {}, result: {}",
@@ -4531,6 +4537,11 @@ void PlayerbotAI::CheckSelfBotMaintenance()
         urand(sPlayerbotAIConfig.minRandomBotRandomizeTime, sPlayerbotAIConfig.maxRandomBotRandomizeTime) * IN_MILLISECONDS;
 
     PlayerbotFactory factory(bot, bot->GetLevel());
+    // Randomize() wipes the bag. On a random bot that costs nothing; on a played
+    // character it destroys quest objectives held as items and rolls the objective
+    // back to zero without a word -- observed live on Milly's Harvest, 6/8 to 0/8 the
+    // moment `bot self` re-armed maintenance.
+    factory.SetKeepInventory(true);
     factory.Randomize(true);
 
     LOG_INFO("playerbots", "SELFBOTMAINT ts={} bot={} level={} nextInSecs={}", uint32(time(nullptr)),

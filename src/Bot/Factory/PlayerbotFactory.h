@@ -58,6 +58,9 @@ public:
     static void Init();
     void Refresh();
     void Randomize(bool incremental);
+    // A played character's bag is its own. Randomize() wipes it unconditionally, which
+    // destroys quest objectives held as items -- see CheckSelfBotMaintenance.
+    void SetKeepInventory(bool keep) { keepInventory = keep; }
     static std::list<uint32> classQuestIds;
     void ClearEverything();
     void InitSkills();
@@ -219,6 +222,7 @@ private:
     uint32 level;
     uint32 itemQuality;
     uint32 gearScoreLimit;
+    bool keepInventory = false;
     static std::list<uint32> specialQuestIds;
     static std::unordered_map<uint32, std::vector<uint32>> trainerIdCache;
     static std::vector<uint32> enchantSpellIdCache;

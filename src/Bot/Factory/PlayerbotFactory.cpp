@@ -640,7 +640,11 @@ void PlayerbotFactory::Randomize(bool incremental)
             ClearAllItems();
         }
     }
-    ClearInventory();
+    // Not for a played character: the bag holds quest objectives counted as items
+    // (Milly's Harvest is eight of item 11119), and wiping it silently rolls the
+    // objective back to zero. See PlayerbotAI::CheckSelfBotMaintenance.
+    if (!keepInventory)
+        ClearInventory();
     bot->RemoveAllSpellCooldown();
     UnbindInstance();
 
@@ -1717,7 +1721,32 @@ void PlayerbotFactory::InitTalentsByParsedSpecLink(Player* bot, std::vector<std:
 class DestroyItemsVisitor : public IterateItemsVisitor
 {
 public:
-    DestroyItemsVisitor(Player* bot) : IterateItemsVisitor(), bot(bot) {}
+    DestroyItemsVisitor(Player* bot) : IterateItemsVisitor(), bot(bot)
+    {
+        // Quest objectives are frequently held as items -- Milly's Harvest is eight of
+        // item 11119, and the objective counter *is* the bag count. Destroying them rolls
+        // the quest back to zero with no message, which is how a bot ends up walking the
+        // same field forever. RandomBotQuestItems is a nine-entry hardcoded list; the
+        // question is not "is this item on a list" but "is this item something I am
+        // currently being asked to collect".
+        for (uint8 slot = 0; slot < MAX_QUEST_LOG_SIZE; ++slot)
+        {
+            uint32 questId = bot->GetQuestSlotQuestId(slot);
+            if (!questId)
+                continue;
+
+            Quest const* quest = sObjectMgr->GetQuestTemplate(questId);
+            if (!quest)
+                continue;
+
+            for (uint8 i = 0; i < QUEST_ITEM_OBJECTIVES_COUNT; ++i)
+                if (uint32 reqItem = quest->RequiredItemId[i])
+                    questItems.insert(reqItem);
+
+            if (uint32 srcItem = quest->GetSrcItemId())
+                questItems.insert(srcItem);
+        }
+    }
 
     bool Visit(Item* item) override
     {
@@ -1735,6 +1764,11 @@ public:
 private:
     bool CanKeep(uint32 id)
     {
+        // Checked before the one-of-each rule below: an objective asks for eight of the
+        // item, so keeping a single copy is the same as failing the quest.
+        if (questItems.find(id) != questItems.end())
+            return true;
+
         if (keep.find(id) != keep.end())
             return false;
 
@@ -1746,6 +1780,7 @@ private:
 
     Player* bot;
     std::set<uint32> keep;
+    std::set<uint32> questItems;
 };
 
 bool PlayerbotFactory::CanEquipArmor(ItemTemplate const* proto)
