@@ -7,18 +7,18 @@
 #ifndef PLAYERBOTS_MOVEMENTACTIONS_H
 #define PLAYERBOTS_MOVEMENTACTIONS_H
 
-#include <cmath>
-
 #include "Action.h"
 #include "LastMovementValue.h"
 #include "PathGenerator.h"
 #include "PlayerbotAIConfig.h"
+#include <cmath>
 
 class Player;
 class PlayerbotAI;
 class Unit;
 class WorldObject;
-class Position;
+
+struct Position;
 
 #define ANGLE_45_DEG (static_cast<float>(M_PI) / 4.f)
 #define ANGLE_90_DEG M_PI_2
@@ -176,16 +176,12 @@ private:
 class FleeAction : public MovementAction
 {
 public:
-    FleeAction(PlayerbotAI* botAI, float distance = sPlayerbotAIConfig.spellDistance)
-        : MovementAction(botAI, "flee"), distance(distance)
+    FleeAction(PlayerbotAI* botAI) : MovementAction(botAI, "flee")
     {
     }
 
     bool Execute(Event event) override;
     bool isUseful() override;
-
-private:
-    float distance;
 };
 
 class FleeWithPetAction : public MovementAction

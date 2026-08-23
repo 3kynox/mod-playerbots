@@ -4,10 +4,8 @@
  */
 
 #include "LootAction.h"
-
-#include <limits>
-
 #include "Bag.h"
+#include "BroadcastHelper.h"
 #include "ChatHelper.h"
 #include "Event.h"
 #include "GuildMgr.h"
@@ -18,8 +16,7 @@
 #include "PlayerbotAIConfig.h"
 #include "Playerbots.h"
 #include "ServerFacade.h"
-#include "GuildMgr.h"
-#include "BroadcastHelper.h"
+#include <limits>
 
 bool LootAction::Execute(Event /*event*/)
 {
@@ -38,9 +35,8 @@ bool LootAction::Execute(Event /*event*/)
         // bot->GetSession()->HandleLootReleaseOpcode(packet);
     }
 
-    // Provide a system to check if the game object id is disallowed in the user configurable list or not.
-    // Check if the game object id is disallowed in the user configurable list or not.
-    if (sPlayerbotAIConfig.disallowedGameObjects.find(lootObject.guid.GetEntry()) != sPlayerbotAIConfig.disallowedGameObjects.end())
+    if (lootObject.guid.IsGameObject() &&
+        sPlayerbotAIConfig.disallowedGameObjects.contains(lootObject.guid.GetEntry()))
     {
         return false;  // Game object ID is disallowed, so do not proceed
     }
@@ -54,7 +50,7 @@ bool LootAction::Execute(Event /*event*/)
 bool LootAction::isUseful()
 {
     return sPlayerbotAIConfig.freeMethodLoot || !bot->GetGroup() ||
-    bot->GetGroup()->GetLootMethod() != FREE_FOR_ALL || botAI->IsRealPlayer();
+    bot->GetGroup()->GetLootMethod() != FREE_FOR_ALL || IsSelfBot(bot);
 }
 
 enum ProfessionSpells
@@ -95,7 +91,7 @@ bool OpenLootAction::Execute(Event /*event*/)
 // exact path — played characters only, random bots would flood the log.
 void OpenLootAction::TraceLootFailure(LootObject const& lootObject, char const* reason)
 {
-    if (!botAI->IsRealPlayer())
+    if (!IsSelfBot(bot))
         return;
 
     WorldObject* obj = botAI->GetCreature(lootObject.guid)
@@ -109,7 +105,7 @@ void OpenLootAction::TraceLootFailure(LootObject const& lootObject, char const* 
 
 void OpenLootAction::TraceLootQueued(LootObject const& lootObject)
 {
-    if (!botAI->IsRealPlayer())
+    if (!IsSelfBot(bot))
         return;
 
     Creature* creature = botAI->GetCreature(lootObject.guid);
@@ -121,7 +117,7 @@ void OpenLootAction::TraceLootQueued(LootObject const& lootObject)
 
 void OpenLootAction::TraceLootCastSent(LootObject const& lootObject, uint32 spellId)
 {
-    if (!botAI->IsRealPlayer())
+    if (!IsSelfBot(bot))
         return;
 
     uint32 goEntry = 0;
@@ -526,7 +522,7 @@ bool StoreLootAction::Execute(Event event)
             continue;
 
         // bags >80%: skip non-stackable junk (quest items exempt)
-        if (!botAI->HasActivePlayerMaster() && AI_VALUE(uint8, "bag space") > 80 &&
+        if (!IsRealPlayer(botAI->GetMaster()) && AI_VALUE(uint8, "bag space") > 80 &&
             !bot->HasQuestForItem(itemid))
         {
             uint32 maxStack = proto->GetMaxStackSize();
@@ -687,7 +683,7 @@ bool StoreLootAction::IsLootAllowed(uint32 itemid, PlayerbotAI* botAI)
     //{
 
     bool canLoot = lootStrategy->CanLoot(proto, context);
-    // if (canLoot && proto->Bonding == BIND_WHEN_PICKED_UP && botAI->HasActivePlayerMaster())
+    // if (canLoot && proto->Bonding == BIND_WHEN_PICKED_UP && IsRealPlayer(botAI->GetMaster()))
     // canLoot = sPlayerbotAIConfig.IsInRandomAccountList(botAI->GetBot()->GetSession()->GetAccountId());
 
     return canLoot;

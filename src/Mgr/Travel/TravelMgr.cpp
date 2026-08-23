@@ -5,30 +5,28 @@
  */
 
 #include "TravelMgr.h"
-
-#include <iomanip>
-#include <numeric>
-
 #include "AreaDefines.h"
+#include "CellImpl.h"
+#include "ChatHelper.h"
+#include "Corpse.h"
 #include "Creature.h"
 #include "Log.h"
-#include "ObjectAccessor.h"
-#include "TravelNode.h"
-#include "Talentspec.h"
-#include "ChatHelper.h"
+#include "Map.h"
 #include "MapCollisionData.h"
 #include "MapMgr.h"
 #include "ModelIgnoreFlags.h"
+#include "ObjectAccessor.h"
 #include "PathGenerator.h"
 #include "Playerbots.h"
 #include "RaceMgr.h"
+#include "Talentspec.h"
 #include "Transport.h"
 #include "TransportMgr.h"
+#include "TravelNode.h"
 #include "VMapFactory.h"
 #include "VMapMgr2.h"
-#include "Map.h"
-#include "Corpse.h"
-#include "CellImpl.h"
+#include <iomanip>
+#include <numeric>
 
 // Navigation data
 

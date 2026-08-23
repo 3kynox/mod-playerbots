@@ -7,10 +7,9 @@
 #ifndef PLAYERBOTS_TRAVELNODE_H
 #define PLAYERBOTS_TRAVELNODE_H
 
-#include <shared_mutex>
-
 #include "G3D/Vector3.h"
 #include "TravelMgr.h"
+#include <shared_mutex>
 
 class PlayerbotAI;
 

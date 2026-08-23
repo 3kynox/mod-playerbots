@@ -5,13 +5,11 @@
  */
 
 #include "CheckValuesAction.h"
-
-#include "Event.h"
-#include "ObjectGuid.h"
-#include "ServerFacade.h"
-
-#include "PlayerbotAI.h"
 #include "AiObjectContext.h"
+#include "Event.h"
+#include "PlayerbotAI.h"
+#include "ServerFacade.h"
+#include "TravelNode.h"
 
 CheckValuesAction::CheckValuesAction(PlayerbotAI* botAI) : Action(botAI, "check values") {}
 

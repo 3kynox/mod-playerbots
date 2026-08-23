@@ -7,16 +7,15 @@
 #ifndef PLAYERBOTS_TRAVELMGR_H
 #define PLAYERBOTS_TRAVELMGR_H
 
-#include <boost/functional/hash.hpp>
-#include <cmath>
-#include <map>
-#include <random>
-
 #include "AiObject.h"
 #include "CreatureData.h"
 #include "GameObject.h"
 #include "GridDefines.h"
 #include "PlayerbotAIConfig.h"
+#include <boost/functional/hash.hpp>
+#include <cmath>
+#include <map>
+#include <random>
 
 class Creature;
 class GuidPosition;

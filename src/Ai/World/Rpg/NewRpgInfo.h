@@ -111,6 +111,7 @@ struct NewRpgInfo
     RpgData data;
 
     NewRpgStatus GetStatus();
+    static NewRpgStatus StatusFromString(std::string const& name);
     bool HasStatusPersisted(uint32 maxDuration) { return GetMSTimeDiffToNow(startT) > maxDuration; }
     void ChangeToGoGrind(WorldPosition pos);
     void ChangeToGoCamp(WorldPosition pos);

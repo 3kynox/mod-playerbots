@@ -5,12 +5,10 @@
  */
 
 #include "NonCombatActions.h"
-
-#include <algorithm>
-#include <cmath>
-
 #include "Event.h"
 #include "Playerbots.h"
+#include <algorithm>
+#include <cmath>
 
 namespace
 {
