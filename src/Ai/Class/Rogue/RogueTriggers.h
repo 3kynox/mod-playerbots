@@ -88,10 +88,6 @@ public:
     StealthTrigger(PlayerbotAI* botAI) : Trigger(botAI, "stealth") {}
 
     bool IsActive() override;
-
-private:
-    // Travelling with no designated target: stealth on proximity to anything hostile.
-    bool ShouldStealthApproach();
 };
 
 class SapTrigger : public HasCcTargetTrigger
