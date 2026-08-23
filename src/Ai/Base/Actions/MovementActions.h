@@ -186,11 +186,6 @@ public:
 
 private:
     float distance;
-    // A retreat is decided once and then held. Recomputing the best direction every tick
-    // made the bot stutter: the score shifts as it moves, so the destination moved with it
-    // and each MoveTo cut the previous spline short.
-    float fleeX = 0.0f, fleeY = 0.0f, fleeZ = 0.0f;
-    time_t fleeUntil = 0;
 };
 
 class FleeWithPetAction : public MovementAction

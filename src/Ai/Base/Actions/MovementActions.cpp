@@ -6,11 +6,9 @@
 
 #include "MovementActions.h"
 
-#include <algorithm>
 #include <cmath>
 #include <cstdlib>
 #include <iomanip>
-#include <limits>
 #include <sstream>
 #include <string>
 
@@ -2004,123 +2002,12 @@ void MovementAction::DoMovePoint(Unit* unit, float x, float y, float z, bool gen
 
 bool FleeAction::Execute(Event /*event*/)
 {
-    // Backpedalling uses MOVE_RUN_BACK: 4.5 yards/s against the 7.0 of anything chasing the
-    // bot. Breaking contact that way is arithmetically impossible -- the attacker stays in
-    // melee for the whole retreat, and the bot, never turning, drags its aggro through
-    // everything on the path. Retreating face-forward at least runs at the same speed as
-    // the pursuer. Keeping the target in front while stepping out of melee is a different
-    // job, and it already has its own action (MoveOutOfEnemyContactAction).
-    Unit* target = AI_VALUE(Unit*, "current target");
-    if (!target)
-        return false;
-
-    // A retreat already under way is kept. The direction is decided once, at the first tick
-    // of the flight, and held until the bot arrives or the retreat times out. Recomputing it
-    // every tick made the bot pick a direction, stop, pick another, stop again: the score
-    // moves with the bot, so the destination kept sliding and every new MoveTo cut the
-    // previous spline. A retreat that stutters is a retreat that never breaks contact.
-    time_t const now = time(nullptr);
-    if (now < fleeUntil && bot->GetExactDist2d(fleeX, fleeY) > 3.0f)
-        return true;
-
-    // Straight away from the attacker is not the same as away from danger. In a mine
-    // corridor the opposite direction points deeper in, so the bot flees into the mobs it
-    // had not pulled yet and dies with a bigger pack than it started with -- observed in
-    // Fargodeep Mine. Score each candidate by its total distance to every hostile that can
-    // see it and keep the best one, which is what cmangos/playerbots does in FleeManager.
-    // AiPlayerbot.FleeDistance defaults to five yards, which is the length of a melee swing:
-    // the bot reached the point in under a second, this function ran again, picked a fresh
-    // direction and set off once more. That is the "run, pause, turn, run" seen in game, and
-    // it is also why fleeing never broke contact -- five yards outruns nothing. Retreat far
-    // enough for the flight to mean something, keeping the configured value as a floor.
-    float const distance = std::max(sPlayerbotAIConfig.fleeDistance, 25.0f);
-    float const initAngle = target->GetAngle(bot);
-
-    GuidVector hostiles = AI_VALUE(GuidVector, "possible targets no los");
-    float bestScore = -std::numeric_limits<float>::max();
-    float bestX = 0.0f, bestY = 0.0f, bestZ = 0.0f;
-    bool bestExact = true;
-
-    for (float delta = 0; delta <= M_PI / 2; delta += M_PI / 8)
-    {
-        for (int8 sign = 1; sign >= -1; sign -= 2)
-        {
-            if (delta == 0 && sign < 0)
-                continue;
-
-            float const angle = initAngle + sign * delta;
-            float x = bot->GetPositionX() + cos(angle) * distance;
-            float y = bot->GetPositionY() + sin(angle) * distance;
-            float z = bot->GetPositionZ();
-            bool exact = bot->GetMap()->CheckCollisionAndGetValidCoords(bot, bot->GetPositionX(),
-                                                                       bot->GetPositionY(),
-                                                                       bot->GetPositionZ(), x, y, z);
-            if (!exact)
-            {
-                x = bot->GetPositionX() + cos(angle) * distance;
-                y = bot->GetPositionY() + sin(angle) * distance;
-                z = bot->GetPositionZ();
-            }
-
-            // Sum, not minimum: one nearby attacker must not outweigh running into six.
-            float score = 0.0f;
-            for (ObjectGuid const& guid : hostiles)
-            {
-                Unit* unit = botAI->GetUnit(guid);
-                if (!unit || !unit->IsAlive())
-                    continue;
-
-                // A mob that cannot see the destination is not a threat there.
-                if (!unit->IsWithinLOS(x, y, z + unit->GetCollisionHeight()))
-                    continue;
-
-                score += unit->GetExactDist2d(x, y);
-            }
-
-            // Penalise sideways angles. initAngle points back the way the bot came from --
-            // the ground it has already crossed, hence the ground it knows is clear -- so
-            // the retreat should read as going back, and only bend off that axis when doing
-            // so genuinely avoids more mobs.
-            score -= delta * 30.0f;
-
-            if (score > bestScore)
-            {
-                bestScore = score;
-                bestX = x;
-                bestY = y;
-                bestZ = z;
-                bestExact = exact;
-            }
-        }
-    }
-
-    if (bestScore > -std::numeric_limits<float>::max() &&
-        MoveTo(target->GetMapId(), bestX, bestY, bestZ, false, false, true, bestExact,
-               MovementPriority::MOVEMENT_COMBAT, false, false))
-    {
-        fleeX = bestX;
-        fleeY = bestY;
-        fleeZ = bestZ;
-        fleeUntil = now + 5;
-        return true;
-    }
-
-    // No candidate was reachable: fall back to the plain "opposite the attacker" sweep.
-    return MoveAway(target, distance, false);
+    return MoveAway(AI_VALUE(Unit*, "current target"), sPlayerbotAIConfig.fleeDistance, true);
 }
 
 bool FleeAction::isUseful()
 {
     if (bot->GetCurrentSpell(CURRENT_CHANNELED_SPELL) != nullptr)
-        return false;
-
-    // One attacker is a fight, not a rout. OutNumberedTrigger weighs a foe at
-    // max(100 + 10*dLevel, dLevel*200), so a single mob two levels up already scores 400
-    // against a healthy bot's 200 and trips flee on the opening blow -- the bot then runs,
-    // never breaks contact, and dies tired. Above critical health, stand and fight when
-    // only one thing is on us; panic and critical health still have their own triggers.
-    if (AI_VALUE(uint8, "attacker count") <= 1 &&
-        AI_VALUE2(uint8, "health", "self target") > sPlayerbotAIConfig.criticalHealth)
         return false;
 
     Unit* target = AI_VALUE(Unit*, "current target");
