@@ -127,9 +127,14 @@ namespace
         std::vector<ObjectGuid::LowType> humans;
         int32 refillIn;
         int32 ttl;
+        // A human that leaves the queue emits no event: without a cap, its
+        // phantom wait entry would re-fill (and pop) full battlegrounds
+        // every 30s until the TTL. Each real enqueue re-arms the budget.
+        int32 refillsLeft;
     };
     std::vector<ClusterBGWait> clusterBGWaits;
     constexpr int32 CLUSTER_BG_REFILL_MS = 30 * 1000;
+    constexpr int32 CLUSTER_BG_REFILL_BUDGET = 4;
 
     void RemoveWaitingHuman(ObjectGuid::LowType guidLow);
     void FillBGQueue(uint32 typeId, uint32 minLvl, uint32 maxLvl);
@@ -705,11 +710,13 @@ namespace
         if (!wait)
         {
             clusterBGWaits.push_back({uint32(typeId), uint32(minLvl), uint32(maxLvl), {},
-                                      CLUSTER_BG_REFILL_MS, CLUSTER_BG_QUEUE_TTL_MS});
+                                      CLUSTER_BG_REFILL_MS, CLUSTER_BG_QUEUE_TTL_MS,
+                                      CLUSTER_BG_REFILL_BUDGET});
             wait = &clusterBGWaits.back();
         }
         wait->refillIn = CLUSTER_BG_REFILL_MS;
         wait->ttl = CLUSTER_BG_QUEUE_TTL_MS;
+        wait->refillsLeft = CLUSTER_BG_REFILL_BUDGET;
 
         for (uint64 guidRaw : queued)
         {
@@ -887,11 +894,12 @@ private:
             }
 
             itr->refillIn -= int32(diff);
-            if (itr->refillIn <= 0)
+            if (itr->refillIn <= 0 && itr->refillsLeft > 0)
             {
                 itr->refillIn = CLUSTER_BG_REFILL_MS;
-                LOG_INFO("playerbots", "Cluster: re-fill pass for BG type {} bracket {}-{} ({} humans waiting)",
-                         itr->typeId, itr->minLvl, itr->maxLvl, itr->humans.size());
+                --itr->refillsLeft;
+                LOG_INFO("playerbots", "Cluster: re-fill pass for BG type {} bracket {}-{} ({} humans waiting, {} passes left)",
+                         itr->typeId, itr->minLvl, itr->maxLvl, itr->humans.size(), itr->refillsLeft);
                 FillBGQueue(itr->typeId, itr->minLvl, itr->maxLvl);
             }
 
