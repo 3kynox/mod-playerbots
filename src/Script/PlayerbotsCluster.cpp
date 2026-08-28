@@ -845,10 +845,28 @@ namespace
 
                 clusterBGEjectHolds.push_back({bg->GetInstanceID(), uint8(team), CLUSTER_BG_EJECT_HOLD_MS});
                 clusterBGEjecting.insert(memberGuid.GetCounter());
-                bool left = BGStatusAction::LeaveBG(botAI);
+                BGStatusAction::LeaveBG(botAI);
+                // LeaveBG's CMSG path is silently refused while the bot is in
+                // combat (BattleGroundHandler "not allow leave battleground in
+                // combat") and reports success anyway — seen live: the ejected
+                // bot stayed seated, no left event, the human never invited.
+                // An ejection is a server decision: force the leave through.
+                if (member->InBattleground())
+                {
+                    member->CombatStop(true);
+                    member->LeaveBattleground(bg);
+                }
                 clusterBGEjecting.erase(memberGuid.GetCounter());
+                // The seat is only freed at the map switch (RemovePlayerAtLeave
+                // runs in Map::RemovePlayerFromMap): a pending teleport out is
+                // a success, still seated with no teleport is the failure.
+                bool left = !member->InBattleground() || member->IsBeingTeleported();
                 if (!left)
+                {
                     clusterBGEjectHolds.pop_back();
+                    LOG_WARN("playerbots", "Cluster: ejection of bot {} from BG instance {} FAILED (still seated)",
+                             member->GetName(), bg->GetInstanceID());
+                }
 
                 return left;
             }
