@@ -166,6 +166,33 @@ namespace
     // veto (OnPlayerBeforeTeleport) wave their leave through.
     std::unordered_set<ObjectGuid::LowType> clusterBGEjecting;
 
+    // Cross-shard bracket pull: a reconcile pass short of local bots
+    // broadcasts the need; each OWNING shard hands over what it can spare
+    // (it alone knows which of its bots are truly idle) by teleporting them
+    // to the requester's anchor — the partition handoff and
+    // RegisterHandedOffBot make them eligible on a later pass (~8s).
+    constexpr char CLUSTER_BG_PULL_SUBJECT[] = "playerbots.cluster.bg.pull";
+    constexpr int32 CLUSTER_BG_PULL_COOLDOWN_MS = 30 * 1000;  // per queue key, covers the travel
+    constexpr uint32 CLUSTER_BG_PULL_MAX_PER_ASK = 4;         // per provider per request
+    constexpr uint32 CLUSTER_BG_PULL_PROVIDER_FLOOR = 6;      // eligible bots a provider keeps
+
+    // World thread only. Key: typeId<<32 | minLvl<<8 | pvpTeamId.
+    std::unordered_map<uint64, int32> clusterBGPullCooldowns;
+
+    // Fed by the NATS handler, drained on the world thread.
+    struct ClusterPendingBGPull
+    {
+        uint32 typeId;
+        uint32 minLvl;
+        uint32 maxLvl;
+        uint8 pvpTeamId;
+        uint32 count;
+        uint32 destMap;
+        float x, y, z, o;
+    };
+    std::mutex clusterPendingBGPullMutex;
+    std::vector<ClusterPendingBGPull> clusterPendingBGPulls;
+
     struct BGFillPick
     {
         ObjectGuid::LowType guid;
@@ -212,6 +239,15 @@ namespace
             return false;
 
         return sscanf(json.c_str() + pos + needle.size(), "%llu", (unsigned long long*)&out) == 1;
+    }
+
+    bool ExtractJsonFloat(std::string const& json, char const* key, float& out)
+    {
+        std::string needle = std::string("\"") + key + "\":";
+        size_t pos = json.find(needle);
+        if (pos == std::string::npos)
+            return false;
+        return sscanf(json.c_str() + pos + needle.size(), "%f", &out) == 1;
     }
 
     // String variant. Handles the escapes Go's json.Marshal emits inside chat
@@ -944,6 +980,34 @@ namespace
             RemoveWaitingHuman(ObjectGuid::LowType(guidRaw));
         }
     }
+
+    // NATS thread. Park the cross-shard pull request for the world thread.
+    void OnClusterBGPull(char const* /*subject*/, char const* payload, int payloadLen)
+    {
+        if (!sPlayerbotAIConfig.enabled)
+            return;
+
+        std::string data(payload, payloadLen);
+        uint64 typeId, minLvl, maxLvl, teamId, count, destMap;
+        float x, y, z, o;
+        if (!ExtractJsonUInt64(data, "TypeID", typeId) || !ExtractJsonUInt64(data, "MinLvl", minLvl) ||
+            !ExtractJsonUInt64(data, "MaxLvl", maxLvl) || !ExtractJsonUInt64(data, "PvpTeamID", teamId) ||
+            !ExtractJsonUInt64(data, "Count", count) || !ExtractJsonUInt64(data, "DestMap", destMap) ||
+            !ExtractJsonFloat(data, "X", x) || !ExtractJsonFloat(data, "Y", y) ||
+            !ExtractJsonFloat(data, "Z", z) || !ExtractJsonFloat(data, "O", o))
+            return;
+
+        // Our own broadcast: the requester is the shard serving the anchor map.
+        if (sToCloud9Sidecar->IsMapAssigned(uint32(destMap)))
+            return;
+
+        if (!teamId || teamId > 2 || !count)
+            return;
+
+        std::lock_guard<std::mutex> lock(clusterPendingBGPullMutex);
+        clusterPendingBGPulls.push_back({uint32(typeId), uint32(minLvl), uint32(maxLvl),
+                                         uint8(teamId), uint32(count), uint32(destMap), x, y, z, o});
+    }
 }
 
 namespace PlayerbotsCluster
@@ -1045,12 +1109,14 @@ public:
                 sToCloud9Sidecar->NatsSubscribe(GUILD_MESSAGE_NEW_SUBJECT, &OnClusterGuildChatMessage) &&
                 sToCloud9Sidecar->NatsSubscribe(MATCHMAKING_INVITED_SUBJECT, &OnClusterBGInvite) &&
                 sToCloud9Sidecar->NatsSubscribe(MATCHMAKING_QUEUED_SUBJECT, &OnClusterBGQueueJoined) &&
-                sToCloud9Sidecar->NatsSubscribe(MATCHMAKING_EXPIRED_SUBJECT, &OnClusterBGInviteExpired);
+                sToCloud9Sidecar->NatsSubscribe(MATCHMAKING_EXPIRED_SUBJECT, &OnClusterBGInviteExpired) &&
+                sToCloud9Sidecar->NatsSubscribe(CLUSTER_BG_PULL_SUBJECT, &OnClusterBGPull);
 
         UpdateCooldowns(diff);
         ProcessPendingKicks();
         ProcessPendingLogins(diff);
         ProcessPendingBGJoins(diff);
+        ProcessBGPulls();
         ProcessBGRefills(diff);
         ProcessBGReconcile(diff);
     }
@@ -1105,8 +1171,125 @@ private:
     // (the matchmaking, retail backfill, remains the only seat writer), and
     // drop phantom wait entries (a tracked human already inside a local
     // battleground was invited without us seeing the event — seen live).
+    // World thread. Serve parked cross-shard pull requests: hand over only
+    // bots that are provably idle HERE (no group, no BG, no queue), keep a
+    // floor so a starved bracket never empties another shard, cap the batch;
+    // the foreign-map teleport triggers the partition handoff.
+    void ProcessBGPulls()
+    {
+        std::vector<ClusterPendingBGPull> pulls;
+        {
+            std::lock_guard<std::mutex> lock(clusterPendingBGPullMutex);
+            pulls.swap(clusterPendingBGPulls);
+        }
+
+        for (ClusterPendingBGPull const& pull : pulls)
+        {
+            std::vector<Player*> eligible;
+            for (auto it = sRandomPlayerbotMgr.GetPlayerBotsBegin();
+                 it != sRandomPlayerbotMgr.GetPlayerBotsEnd(); ++it)
+            {
+                Player* bot = it->second;
+                if (!bot || !bot->IsInWorld() || !bot->GetSession() || !bot->GetSession()->IsBot() ||
+                    !sRandomPlayerbotMgr.IsRandomBot(bot))
+                    continue;
+
+                if (bot->GetGroup() || bot->InBattleground() || bot->InBattlegroundQueue() || !bot->IsAlive())
+                    continue;
+
+                if (clusterBGQueuedBots.count(bot->GetGUID().GetCounter()))
+                    continue;
+
+                uint32 level = bot->GetLevel();
+                if (level < pull.minLvl || level > pull.maxLvl)
+                    continue;
+
+                if ((bot->GetTeamId() == TEAM_HORDE ? 2u : 1u) != pull.pvpTeamId)
+                    continue;
+
+                // Mid-handoff already: don't reroute it.
+                if (!sToCloud9Sidecar->IsMapAssigned(bot->GetMapId()))
+                    continue;
+
+                eligible.push_back(bot);
+            }
+
+            uint32 spare = eligible.size() > CLUSTER_BG_PULL_PROVIDER_FLOOR
+                               ? uint32(eligible.size()) - CLUSTER_BG_PULL_PROVIDER_FLOOR
+                               : 0;
+            uint32 give = std::min({pull.count, spare, CLUSTER_BG_PULL_MAX_PER_ASK});
+            if (!give)
+                continue;
+
+            LOG_INFO("playerbots",
+                     "Cluster: BG pull hands over {} bot(s) to map {} (type {} bracket {}-{} team {} asked {})",
+                     give, pull.destMap, pull.typeId, pull.minLvl, pull.maxLvl, uint32(pull.pvpTeamId), pull.count);
+
+            for (uint32 i = 0; i < give; ++i)
+                eligible[i]->TeleportTo(pull.destMap, pull.x, pull.y, pull.z, pull.o);
+        }
+    }
+
+    // World thread. Broadcast the unmet deficit with a safe landing anchor
+    // (a live local bot's spot on one of our maps). Cooldown per queue key:
+    // one ask per travel window, the next reconcile pass re-measures.
+    void RequestCrossShardBots(uint32 typeId, uint32 minLvl, uint32 maxLvl, uint8 pvpTeamId, uint32 count)
+    {
+        uint64 key = (uint64(typeId) << 32) | (uint64(minLvl) << 8) | pvpTeamId;
+        if (clusterBGPullCooldowns.count(key))
+            return;
+
+        Player* anchor = nullptr;
+        for (auto it = sRandomPlayerbotMgr.GetPlayerBotsBegin();
+             it != sRandomPlayerbotMgr.GetPlayerBotsEnd(); ++it)
+        {
+            Player* bot = it->second;
+            if (!bot || !bot->IsInWorld() || !bot->IsAlive() || bot->InBattleground() ||
+                !bot->GetSession() || !bot->GetSession()->IsBot() ||
+                !sToCloud9Sidecar->IsMapAssigned(bot->GetMapId()))
+                continue;
+
+            anchor = bot;
+            break;
+        }
+
+        if (!anchor)
+        {
+            LOG_WARN("playerbots", "Cluster: BG pull skipped, no live local bot to anchor the landing");
+            return;
+        }
+
+        clusterBGPullCooldowns[key] = CLUSTER_BG_PULL_COOLDOWN_MS;
+
+        char payload[256];
+        snprintf(payload, sizeof(payload),
+                 "{\"TypeID\":%u,\"MinLvl\":%u,\"MaxLvl\":%u,\"PvpTeamID\":%u,\"Count\":%u,"
+                 "\"DestMap\":%u,\"X\":%.2f,\"Y\":%.2f,\"Z\":%.2f,\"O\":%.2f}",
+                 typeId, minLvl, maxLvl, uint32(pvpTeamId), count, anchor->GetMapId(),
+                 anchor->GetPositionX(), anchor->GetPositionY(), anchor->GetPositionZ(),
+                 anchor->GetOrientation());
+
+        std::string msg(payload);
+        std::thread([msg]() {
+            if (!sToCloud9Sidecar->NatsPublish(CLUSTER_BG_PULL_SUBJECT, msg))
+                LOG_WARN("playerbots", "Cluster: BG pull publish failed");
+        }).detach();
+
+        LOG_INFO("playerbots", "Cluster: BG pull published (type {} bracket {}-{} team {} need {})",
+                 typeId, minLvl, maxLvl, uint32(pvpTeamId), count);
+    }
+
     void ProcessBGReconcile(uint32 diff)
     {
+        for (auto itr = clusterBGPullCooldowns.begin(); itr != clusterBGPullCooldowns.end();)
+        {
+            itr->second -= int32(diff);
+            if (itr->second <= 0)
+                itr = clusterBGPullCooldowns.erase(itr);
+            else
+                ++itr;
+        }
+
         clusterBGReconcileIn -= int32(diff);
         if (clusterBGReconcileIn > 0)
             return;
@@ -1197,8 +1380,11 @@ private:
                 }
 
                 if (deficit)
+                {
                     LOG_INFO("playerbots", "Cluster: reconcile BG instance {} team {} still short {} (no eligible bots)",
                              bg->GetInstanceID(), uint32(teamIdx), deficit);
+                    RequestCrossShardBots(typeId, minLvl, maxLvl, uint8(pvpTeamId), deficit);
+                }
             }
         }
 
