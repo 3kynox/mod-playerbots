@@ -26,6 +26,7 @@
 #include "BattleGroundJoinAction.h"
 #include "BattlegroundMgr.h"
 #include "CharacterCache.h"
+#include "DatabaseEnv.h"
 #include "Log.h"
 #include "ObjectAccessor.h"
 #include "ObjectGuid.h"
@@ -601,12 +602,12 @@ namespace
 
             for (ObjectGuid::LowType guidLow : wait.humans)
             {
-                CharacterCacheEntry const* entry = sCharacterCache->GetCharacterCacheByGuid(
-                    ObjectGuid::Create<HighGuid::Player>(guidLow));
-                if (!entry || entry->Level < minLvl || entry->Level > maxLvl)
+                uint32 level = 0;
+                uint8 race = 0;
+                if (!GetLevelAndRace(guidLow, level, race) || level < minLvl || level > maxLvl)
                     continue;
 
-                TeamId team = Player::TeamIdForRace(entry->Race);
+                TeamId team = Player::TeamIdForRace(race);
                 if (team <= TEAM_HORDE && needed[team])
                     --needed[team];
             }
@@ -685,6 +686,29 @@ namespace
             if (hold.instanceId == instanceId && hold.team == team)
                 ++count;
         return count;
+    }
+
+    // BUG-TC9-032: a character created after this worldserver booted is
+    // absent from its CharacterCache until a restart — seen live: a fresh
+    // character could never trigger the ejection. Fall back to the DB row
+    // (sync query, but only on rare human-enqueue events).
+    bool GetLevelAndRace(ObjectGuid::LowType guidLow, uint32& level, uint8& race)
+    {
+        if (CharacterCacheEntry const* entry = sCharacterCache->GetCharacterCacheByGuid(
+                ObjectGuid::Create<HighGuid::Player>(guidLow)))
+        {
+            level = entry->Level;
+            race = entry->Race;
+            return true;
+        }
+
+        QueryResult result = CharacterDatabase.Query("SELECT level, race FROM characters WHERE guid = {}", guidLow);
+        if (!result)
+            return false;
+
+        level = (*result)[0].Get<uint8>();
+        race = (*result)[1].Get<uint8>();
+        return true;
     }
 
     // § F.4: a balanced running battleground accepts nobody through the
@@ -789,6 +813,13 @@ namespace
             !ExtractJsonUInt64Array(data, "PlayersGUID", queued) || queued.empty())
             return;
 
+        // Only the shard hosting this battleground's map fills, ejects and
+        // tracks waits — the others were burning re-fill passes on phantom
+        // "humans" (cross-shard bots they cannot resolve).
+        Battleground* bgTemplate = sBattlegroundMgr->GetBattlegroundTemplate(BattlegroundTypeId(typeId));
+        if (!bgTemplate || !sToCloud9Sidecar->IsMapAssigned(bgTemplate->GetMapId()))
+            return;
+
         // Our own fills echo back through this event: an enqueue where every
         // player is a local bot must not trigger another fill. A human
         // grouping with alt bots still counts as a real enqueue (skipping it
@@ -845,11 +876,11 @@ namespace
             Player* who = ObjectAccessor::FindPlayer(ObjectGuid::Create<HighGuid::Player>(guidLow));
             if (!who || !who->GetSession() || !who->GetSession()->IsBot())
             {
-                CharacterCacheEntry const* entry = sCharacterCache->GetCharacterCacheByGuid(
-                    ObjectGuid::Create<HighGuid::Player>(guidLow));
-                if (entry && entry->Level >= minLvl && entry->Level <= maxLvl)
+                uint32 level = 0;
+                uint8 race = 0;
+                if (GetLevelAndRace(guidLow, level, race) && level >= minLvl && level <= maxLvl)
                 {
-                    TeamId team = Player::TeamIdForRace(entry->Race);
+                    TeamId team = Player::TeamIdForRace(race);
                     if (team <= TEAM_HORDE && EjectBotForWaitingHuman(uint32(typeId), uint32(minLvl), team))
                         return;  // seated by ejection/backfill, no fill needed
                 }
