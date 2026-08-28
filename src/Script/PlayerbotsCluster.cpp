@@ -676,27 +676,40 @@ namespace
 
         // ONE queue entry per faction (leader + members): the matchmaking
         // runs its creation pass after EVERY enqueue and used to pop the
-        // match mid-batch (seen live: 17 enqueued, 6v6 created). Blocking
-        // gRPC calls: keep them off the world thread.
-        std::vector<uint64> factionGuids[2];
-        uint32 factionLeaderLvl[2] = {0, 0};
+        // match mid-batch (seen live: 17 enqueued, 6v6 created). The two
+        // groups are cut to the SAME size — its balancer cannot split a
+        // group, so a 10-bot group facing a 5-bot group would never pop.
+        // The surplus goes in as solos: the retail backfill seats them
+        // right after the match is created. Blocking gRPC calls: off the
+        // world thread.
+        std::vector<BGFillPick> factionPicks[2];
         for (BGFillPick const& pick : picks)
-        {
-            uint32 idx = pick.pvpTeamId == 2 ? 1 : 0;
-            if (factionGuids[idx].empty())
-                factionLeaderLvl[idx] = pick.level;
-            factionGuids[idx].push_back(pick.guid);
-        }
+            factionPicks[pick.pvpTeamId == 2 ? 1 : 0].push_back(pick);
 
-        std::thread([factionGuids, factionLeaderLvl, typeId]() {
+        size_t groupSize = std::min(factionPicks[0].size(), factionPicks[1].size());
+        if (groupSize < std::max<uint32>(1, bgTemplate->GetMinPlayersPerTeam()))
+            groupSize = 0;  // cannot pop anyway: plain solos, nothing to balance
+
+        std::thread([factionPicks, groupSize, typeId]() {
             for (uint32 idx = 0; idx <= 1; ++idx)
             {
-                if (factionGuids[idx].empty())
-                    continue;
-                std::vector<uint64> members(factionGuids[idx].begin() + 1, factionGuids[idx].end());
-                if (!sToCloud9Sidecar->EnqueueLocalGroupToBattleground(
-                        factionGuids[idx][0], factionLeaderLvl[idx], typeId, idx == 1 ? 2u : 1u, members))
-                    LOG_WARN("playerbots", "Cluster: BG group enqueue failed (leader guid {})", factionGuids[idx][0]);
+                std::vector<BGFillPick> const& fp = factionPicks[idx];
+                uint32 pvpTeamId = idx == 1 ? 2u : 1u;
+
+                if (groupSize > 1)
+                {
+                    std::vector<uint64> members;
+                    for (size_t i = 1; i < groupSize; ++i)
+                        members.push_back(fp[i].guid);
+                    if (!sToCloud9Sidecar->EnqueueLocalGroupToBattleground(
+                            fp[0].guid, fp[0].level, typeId, pvpTeamId, members))
+                        LOG_WARN("playerbots", "Cluster: BG group enqueue failed (leader guid {})", fp[0].guid);
+                }
+
+                for (size_t i = (groupSize > 1 ? groupSize : 0); i < fp.size(); ++i)
+                    if (!sToCloud9Sidecar->EnqueueLocalPlayerToBattleground(
+                            fp[i].guid, fp[i].level, typeId, pvpTeamId))
+                        LOG_WARN("playerbots", "Cluster: BG enqueue failed for bot guid {}", fp[i].guid);
             }
         }).detach();
     }
