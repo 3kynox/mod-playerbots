@@ -102,6 +102,11 @@ namespace
         // Backfill joins (C-BG.5) bypass the matchmaking queue: the service
         // never invited the bot, so a joined confirmation would be rejected.
         bool notifyMatchmaking = true;
+        // C-BG.5 refills carry the team they refill (0xFF otherwise): the
+        // join re-checks the headcount on execution — the matchmaking
+        // backfill-on-leave may have seated someone meanwhile (seen live:
+        // one freed slot, two joiners, team over target).
+        uint8 refillTeam = 0xFF;
     };
     std::mutex clusterPendingBGMutex;
     std::vector<ClusterPendingBGJoin> clusterPendingBGJoins;
@@ -155,6 +160,8 @@ namespace
     };
     std::vector<ClusterBGEjectHold> clusterBGEjectHolds;
     constexpr int32 CLUSTER_BG_EJECT_HOLD_MS = 45 * 1000;
+    // Local refills wait out the matchmaking backfill (humans first).
+    constexpr int32 CLUSTER_BG_REFILL_DELAY_MS = 8 * 1000;
 
     // World thread only. Bots being ejected on purpose: lets the teleport
     // veto (OnPlayerBeforeTeleport) wave their leave through.
@@ -1206,6 +1213,24 @@ private:
                 continue;
             }
 
+            // Delayed C-BG.5 refill: only proceed if the team is still short
+            // (the matchmaking backfill has priority on the freed slot).
+            if (join.refillTeam <= TEAM_HORDE)
+            {
+                TeamId team = TeamId(join.refillTeam);
+                TeamId other = team == TEAM_ALLIANCE ? TEAM_HORDE : TEAM_ALLIANCE;
+                uint32 have = bg->GetPlayersCountByTeam(team);
+                uint32 target = std::min<uint32>(
+                    std::max<uint32>(bg->GetMinPlayersPerTeam(), bg->GetPlayersCountByTeam(other)),
+                    bg->GetMaxPlayersPerTeam());
+                if (have + CountEjectHolds(bg->GetInstanceID(), join.refillTeam) >= target)
+                {
+                    LOG_INFO("playerbots", "Cluster: refill of BG instance {} team {} no longer needed, bot {} stays out",
+                             join.instanceId, uint32(team), bot->GetName());
+                    continue;
+                }
+            }
+
             clusterBGBotInstances[join.instanceId] = join.bgTypeId;
 
             BattlegroundTypeId bgTypeId = BattlegroundTypeId(join.bgTypeId);
@@ -1594,7 +1619,8 @@ public:
                 continue;
 
             clusterPendingBGJoins.push_back({guidLow, uint32(bg->GetBgTypeID()), bg->GetInstanceID(),
-                                             CLUSTER_BG_JOIN_ATTEMPTS, 0, false});
+                                             CLUSTER_BG_JOIN_ATTEMPTS, CLUSTER_BG_REFILL_DELAY_MS,
+                                             false, uint8(team)});
             --need;
             ++scheduled;
         }
