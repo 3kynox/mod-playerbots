@@ -23,6 +23,7 @@
 // no playerbots-enabled worldserver serves the destination
 // (AiPlayerbot.ClusterBotMaps).
 
+#include "BattleGroundJoinAction.h"
 #include "BattlegroundMgr.h"
 #include "CharacterCache.h"
 #include "Log.h"
@@ -46,6 +47,8 @@
 #include <mutex>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace
@@ -135,6 +138,26 @@ namespace
     std::vector<ClusterBGWait> clusterBGWaits;
     constexpr int32 CLUSTER_BG_REFILL_MS = 30 * 1000;
     constexpr int32 CLUSTER_BG_REFILL_BUDGET = 4;
+
+    // World thread only. Local battleground instances that contain our bots
+    // (fed by the force-join/backfill path): the ejection scan only makes
+    // sense there, and no public BattlegroundMgr API iterates instances.
+    std::unordered_map<uint32 /*instanceId*/, uint32 /*typeId*/> clusterBGBotInstances;
+
+    // World thread only. Slots freed on purpose for a waiting human (§ F.4):
+    // C-BG.5 must not refill them while the matchmaking invites the human.
+    struct ClusterBGEjectHold
+    {
+        uint32 instanceId;
+        uint8 team;
+        int32 ttl;
+    };
+    std::vector<ClusterBGEjectHold> clusterBGEjectHolds;
+    constexpr int32 CLUSTER_BG_EJECT_HOLD_MS = 45 * 1000;
+
+    // World thread only. Bots being ejected on purpose: lets the teleport
+    // veto (OnPlayerBeforeTeleport) wave their leave through.
+    std::unordered_set<ObjectGuid::LowType> clusterBGEjecting;
 
     void RemoveWaitingHuman(ObjectGuid::LowType guidLow);
     void FillBGQueue(uint32 typeId, uint32 minLvl, uint32 maxLvl);
@@ -655,6 +678,90 @@ namespace
         }).detach();
     }
 
+    uint32 CountEjectHolds(uint32 instanceId, uint8 team)
+    {
+        uint32 count = 0;
+        for (ClusterBGEjectHold const& hold : clusterBGEjectHolds)
+            if (hold.instanceId == instanceId && hold.team == team)
+                ++count;
+        return count;
+    }
+
+    // § F.4: a balanced running battleground accepts nobody through the
+    // matchmaking backfill — a human queuing against a match full of bots
+    // would never enter it. Free one slot by making a random bot leave; the
+    // matchmaking then re-runs the queue pass (PlayerLeftBattleground) and
+    // seats the waiting human. True = a slot was freed or already exists.
+    bool EjectBotForWaitingHuman(uint32 typeId, uint32 minLvl, TeamId team)
+    {
+        for (auto itr = clusterBGBotInstances.begin(); itr != clusterBGBotInstances.end();)
+        {
+            if (itr->second != typeId)
+            {
+                ++itr;
+                continue;
+            }
+
+            Battleground* bg = sBattlegroundMgr->GetBattleground(itr->first, BattlegroundTypeId(typeId));
+            if (!bg)
+            {
+                itr = clusterBGBotInstances.erase(itr);
+                continue;
+            }
+
+            if (bg->GetMinLevel() != minLvl ||
+                (bg->GetStatus() != STATUS_WAIT_JOIN && bg->GetStatus() != STATUS_IN_PROGRESS))
+            {
+                ++itr;
+                continue;
+            }
+
+            TeamId other = team == TEAM_ALLIANCE ? TEAM_HORDE : TEAM_ALLIANCE;
+            uint32 have = bg->GetPlayersCountByTeam(team);
+            uint32 target = std::min<uint32>(
+                std::max<uint32>(bg->GetMinPlayersPerTeam(), bg->GetPlayersCountByTeam(other)),
+                bg->GetMaxPlayersPerTeam());
+            if (have + CountEjectHolds(bg->GetInstanceID(), uint8(team)) < target)
+                return true;  // a backfill slot already exists, matchmaking seats the human
+
+            for (auto const& pair : bg->GetPlayers())
+            {
+                Player* member = pair.second;
+                if (!member || !member->GetSession() || !member->GetSession()->IsBot() ||
+                    !sRandomPlayerbotMgr.IsRandomBot(member))
+                    continue;
+
+                if (member->GetTeamId(true) != team)
+                    continue;
+
+                ObjectGuid memberGuid = member->GetGUID();
+                if (memberGuid == bg->GetFlagPickerGUID(TEAM_ALLIANCE) ||
+                    memberGuid == bg->GetFlagPickerGUID(TEAM_HORDE))
+                    continue;  // never yank a flag carrier
+
+                PlayerbotAI* botAI = GET_PLAYERBOT_AI(member);
+                if (!botAI)
+                    continue;
+
+                LOG_INFO("playerbots", "Cluster: ejecting bot {} from BG instance {} to seat a waiting player",
+                         member->GetName(), bg->GetInstanceID());
+
+                clusterBGEjectHolds.push_back({bg->GetInstanceID(), uint8(team), CLUSTER_BG_EJECT_HOLD_MS});
+                clusterBGEjecting.insert(memberGuid.GetCounter());
+                bool left = BGStatusAction::LeaveBG(botAI);
+                clusterBGEjecting.erase(memberGuid.GetCounter());
+                if (!left)
+                    clusterBGEjectHolds.pop_back();
+
+                return left;
+            }
+
+            ++itr;
+        }
+
+        return false;  // no bot-filled instance of this queue: fill path handles it
+    }
+
     // Runs on the world thread (delivered through ProcessHooks). A player
     // entered a matchmaking BG queue; in vanilla RandomBotJoinBG makes random
     // bots fill both factions so the battleground pops, but the vanilla
@@ -727,6 +834,26 @@ namespace
 
             if (std::find(wait->humans.begin(), wait->humans.end(), guidLow) == wait->humans.end())
                 wait->humans.push_back(guidLow);
+        }
+
+        // § F.4: a solo human queuing while a local bot-filled match of this
+        // bracket is running (and balanced) gets a seat by ejection instead
+        // of waiting for a fresh instance. Groups keep the fill path.
+        if (queued.size() == 1)
+        {
+            ObjectGuid::LowType guidLow = ObjectGuid::LowType(queued[0]);
+            Player* who = ObjectAccessor::FindPlayer(ObjectGuid::Create<HighGuid::Player>(guidLow));
+            if (!who || !who->GetSession() || !who->GetSession()->IsBot())
+            {
+                CharacterCacheEntry const* entry = sCharacterCache->GetCharacterCacheByGuid(
+                    ObjectGuid::Create<HighGuid::Player>(guidLow));
+                if (entry && entry->Level >= minLvl && entry->Level <= maxLvl)
+                {
+                    TeamId team = Player::TeamIdForRace(entry->Race);
+                    if (team <= TEAM_HORDE && EjectBotForWaitingHuman(uint32(typeId), uint32(minLvl), team))
+                        return;  // seated by ejection/backfill, no fill needed
+                }
+            }
         }
 
         FillBGQueue(uint32(typeId), uint32(minLvl), uint32(maxLvl));
@@ -803,6 +930,9 @@ public:
         if (bg->GetStatus() != STATUS_WAIT_JOIN && bg->GetStatus() != STATUS_IN_PROGRESS)
             return true;
 
+        if (clusterBGEjecting.count(player->GetGUID().GetCounter()))
+            return true;  // deliberate ejection (§ F.4), let the leave through
+
         LOG_INFO("playerbots", "Cluster: blocked teleport of BG participant bot {} to map {} (bg instance {} status {})",
                  player->GetName(), mapid, bg->GetInstanceID(), uint32(bg->GetStatus()));
         return false;
@@ -870,11 +1000,32 @@ private:
                 ++itr;
         }
 
+        std::vector<std::pair<uint64, uint32>> staleQueueEntries;
         for (auto itr = clusterBGQueuedBots.begin(); itr != clusterBGQueuedBots.end();)
         {
             itr->second.ttl -= int32(diff);
             if (itr->second.ttl <= 0)
+            {
+                // Never invited within the TTL: also purge the matchmaking
+                // queue entry, or the bot gets invited long after (seen
+                // live: a 26 min leftover joined out of bracket).
+                staleQueueEntries.push_back({uint64(itr->first), itr->second.typeId});
                 itr = clusterBGQueuedBots.erase(itr);
+            }
+            else
+                ++itr;
+        }
+        if (!staleQueueEntries.empty())
+            std::thread([staleQueueEntries]() {
+                for (auto const& entry : staleQueueEntries)
+                    sToCloud9Sidecar->RemovePlayerFromBattlegroundQueue(entry.first, entry.second);
+            }).detach();
+
+        for (auto itr = clusterBGEjectHolds.begin(); itr != clusterBGEjectHolds.end();)
+        {
+            itr->ttl -= int32(diff);
+            if (itr->ttl <= 0)
+                itr = clusterBGEjectHolds.erase(itr);
             else
                 ++itr;
         }
@@ -1006,6 +1157,25 @@ private:
                              join.instanceId, bot->GetName());
                 continue;
             }
+
+            // A bot can outlevel the bracket between the enqueue and the pop
+            // (it keeps questing while queued — seen live: 19 -> 20 during a
+            // 26 min leftover wait). Drop it and purge its queue entry.
+            uint32 botLevel = bot->GetLevel();
+            if (botLevel < bg->GetMinLevel() || botLevel > bg->GetMaxLevel())
+            {
+                LOG_INFO("playerbots", "Cluster: bot {} level {} out of bracket {}-{} of BG instance {}, dropped",
+                         bot->GetName(), botLevel, bg->GetMinLevel(), bg->GetMaxLevel(), join.instanceId);
+                clusterBGQueuedBots.erase(join.guid);
+                uint64 staleGuid = join.guid;
+                uint32 staleType = join.bgTypeId;
+                std::thread([staleGuid, staleType]() {
+                    sToCloud9Sidecar->RemovePlayerFromBattlegroundQueue(staleGuid, staleType);
+                }).detach();
+                continue;
+            }
+
+            clusterBGBotInstances[join.instanceId] = join.bgTypeId;
 
             BattlegroundTypeId bgTypeId = BattlegroundTypeId(join.bgTypeId);
 
@@ -1341,12 +1511,20 @@ public:
         if (team > TEAM_HORDE)
             return;
 
+        // § F.7: refill toward the opposite team's headcount (mirror of the
+        // matchmaking backfill target), not just the minimum — a human
+        // leaving a 6v6 must be replaced by a bot. Slots held for an
+        // ejection stay free for the invited human.
+        TeamId other = team == TEAM_ALLIANCE ? TEAM_HORDE : TEAM_ALLIANCE;
         uint32 have = bg->GetPlayersCountByTeam(team);
-        uint32 minPerTeam = bg->GetMinPlayersPerTeam();
-        if (have >= minPerTeam)
+        uint32 target = std::min<uint32>(
+            std::max<uint32>(bg->GetMinPlayersPerTeam(), bg->GetPlayersCountByTeam(other)),
+            bg->GetMaxPlayersPerTeam());
+        uint32 held = CountEjectHolds(bg->GetInstanceID(), uint8(team));
+        if (have + held >= target)
             return;
 
-        uint32 need = minPerTeam - have;
+        uint32 need = target - have - held;
         uint32 scheduled = 0;
 
         std::lock_guard<std::mutex> lock(clusterPendingBGMutex);
