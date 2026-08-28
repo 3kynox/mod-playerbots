@@ -1423,6 +1423,7 @@ private:
             {
                 LOG_INFO("playerbots", "Cluster: logging in handed-off bot guid {} for map {}", itr->guid, itr->mapId);
                 sRandomPlayerbotMgr.AddPlayerBot(guid, 0);
+                sRandomPlayerbotMgr.RegisterHandedOffBot(itr->guid);
             }
 
             itr = clusterPendingLogins.erase(itr);

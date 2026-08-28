@@ -104,6 +104,10 @@ public:
     uint32 activeBots = 0;
     static bool HandlePlayerbotConsoleCommand(ChatHandler* handler, char const* args);
     bool IsRandomBot(Player* bot);
+    // Cluster handoff: the sending worldserver drops the bot from its own
+    // currentBots; the receiver must register it or the bot stays invisible
+    // to IsRandomBot (BG fills, ejection, and even the partition kick).
+    void RegisterHandedOffBot(ObjectGuid::LowType guid) { currentBots.insert(guid); }
     bool IsRandomBot(ObjectGuid::LowType bot);
     bool IsAddclassBot(Player* bot);
     bool IsAddclassBot(ObjectGuid::LowType bot);
