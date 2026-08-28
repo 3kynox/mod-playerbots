@@ -169,6 +169,7 @@ namespace
 
     void RemoveWaitingHuman(ObjectGuid::LowType guidLow);
     void FillBGQueue(uint32 typeId, uint32 minLvl, uint32 maxLvl);
+    bool GetLevelAndRace(ObjectGuid::LowType guidLow, uint32& level, uint8& race);
 
     bool IsMapServedByClusterBots(uint32 mapId)
     {
