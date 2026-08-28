@@ -132,14 +132,16 @@ namespace
         std::vector<ObjectGuid::LowType> humans;
         int32 refillIn;
         int32 ttl;
-        // A human that leaves the queue emits no event: without a cap, its
-        // phantom wait entry would re-fill (and pop) full battlegrounds
-        // every 30s until the TTL. Each real enqueue re-arms the budget.
-        int32 refillsLeft;
     };
     std::vector<ClusterBGWait> clusterBGWaits;
     constexpr int32 CLUSTER_BG_REFILL_MS = 30 * 1000;
-    constexpr int32 CLUSTER_BG_REFILL_BUDGET = 4;
+    // Wait entries expire on invite/expire events, the reconciler's
+    // validation, or this bound. The old 4-pass refill budget starved
+    // legitimate waits (seen live: reinforcements arrived 18s after the
+    // last pass and nothing ever retried); the phantom-runaway risk it
+    // guarded is covered by the validation and by pops requiring real
+    // capacity anyway.
+    constexpr int32 CLUSTER_BG_WAIT_TTL_MS = 30 * 60 * 1000;
 
     // World thread only. Local battleground instances that contain our bots
     // (fed by the force-join/backfill path): the ejection scan only makes
@@ -883,13 +885,11 @@ namespace
         if (!wait)
         {
             clusterBGWaits.push_back({uint32(typeId), uint32(minLvl), uint32(maxLvl), {},
-                                      CLUSTER_BG_REFILL_MS, CLUSTER_BG_QUEUE_TTL_MS,
-                                      CLUSTER_BG_REFILL_BUDGET});
+                                      CLUSTER_BG_REFILL_MS, CLUSTER_BG_WAIT_TTL_MS});
             wait = &clusterBGWaits.back();
         }
         wait->refillIn = CLUSTER_BG_REFILL_MS;
-        wait->ttl = CLUSTER_BG_QUEUE_TTL_MS;
-        wait->refillsLeft = CLUSTER_BG_REFILL_BUDGET;
+        wait->ttl = CLUSTER_BG_WAIT_TTL_MS;
 
         for (uint64 guidRaw : queued)
         {
@@ -1230,12 +1230,11 @@ private:
             }
 
             itr->refillIn -= int32(diff);
-            if (itr->refillIn <= 0 && itr->refillsLeft > 0)
+            if (itr->refillIn <= 0)
             {
                 itr->refillIn = CLUSTER_BG_REFILL_MS;
-                --itr->refillsLeft;
-                LOG_INFO("playerbots", "Cluster: re-fill pass for BG type {} bracket {}-{} ({} humans waiting, {} passes left)",
-                         itr->typeId, itr->minLvl, itr->maxLvl, itr->humans.size(), itr->refillsLeft);
+                LOG_INFO("playerbots", "Cluster: re-fill pass for BG type {} bracket {}-{} ({} humans waiting)",
+                         itr->typeId, itr->minLvl, itr->maxLvl, itr->humans.size());
                 FillBGQueue(itr->typeId, itr->minLvl, itr->maxLvl);
             }
 
