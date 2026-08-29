@@ -1481,6 +1481,11 @@ private:
                 // position saved on the destination map.
                 LOG_INFO("playerbots", "Cluster: handing off bot {} on foreign map {}", bot->GetName(), mapId);
                 sRandomPlayerbotMgr.LogoutPlayerBot(guid);
+                // Ownership follows the map (mirror of RegisterHandedOffBot):
+                // a guid left in currentBots here keeps getting re-logged by
+                // ProcessBot and ping-pongs between shards until its add
+                // event expires, holding a cap slot on both sides.
+                sRandomPlayerbotMgr.UnregisterHandedOffBot(guid.GetCounter());
 
                 char payload[64];
                 int len = snprintf(payload, sizeof(payload), "{\"g\":%u,\"m\":%u}", guid.GetCounter(), mapId);

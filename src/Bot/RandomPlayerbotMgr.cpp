@@ -1397,6 +1397,23 @@ bool RandomPlayerbotMgr::ProcessBot(uint32 bot)
     uint32 randomTime;
     if (!player)
     {
+        // ToCloud9 cluster: a character saved on a map owned by another
+        // worldserver belongs to that shard's pool now (its add event stays
+        // valid there) — re-logging it here would only get it kicked and
+        // handed off again.
+        if (PlayerbotsCluster::PoolFilterActive())
+        {
+            if (QueryResult mapResult = CharacterDatabase.Query("SELECT map FROM characters WHERE guid = {}", bot))
+            {
+                Field* fields = mapResult->Fetch();
+                if (PlayerbotsCluster::ShouldSkipPoolCandidate(fields[0].Get<uint16>()))
+                {
+                    currentBots.erase(bot);
+                    return false;
+                }
+            }
+        }
+
         AddPlayerBot(botGUID, 0);
         randomTime = urand(1, 2);
 
