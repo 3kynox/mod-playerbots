@@ -1736,6 +1736,28 @@ void PlayerbotMgr::ProcessPendingAltbotReAdd()
     altbotsReAdd.clear();
     altbotsReAddAt = 0;
 
+    // The characters still carry their position from the worldserver the
+    // master just left: re-added as-is they would spawn on a foreign map and
+    // the partition kick would bounce them straight back there. They are
+    // offline right now — park them at the master's feet in DB first. A
+    // master inside an instance keeps them at their old spot (nothing sane
+    // to write without an instance bind).
+    if (!master->GetMap()->Instanceable())
+    {
+        std::istringstream names(command.substr(4));  // strip the "add " prefix
+        std::string name;
+        while (std::getline(names, name, ','))
+        {
+            ObjectGuid guid = sCharacterCache->GetCharacterGuidByName(name);
+            if (!guid)
+                continue;
+
+            Player::SavePositionInDB(master->GetMapId(), master->GetPositionX(),
+                master->GetPositionY(), master->GetPositionZ(), master->GetOrientation(),
+                master->GetZoneId(), guid);
+        }
+    }
+
     LOG_INFO("playerbots", "Cluster: re-adding parked alt bots of {}: {}", master->GetName(), command);
     HandlePlayerbotCommand(command.c_str(), master);
 }
