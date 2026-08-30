@@ -171,6 +171,32 @@ namespace
     // (it alone knows which of its bots are truly idle) by teleporting them
     // to the requester's anchor — the partition handoff and
     // RegisterHandedOffBot make them eligible on a later pass (~8s).
+    // BUG-TC9-071: alt bots parked by a master leaving this worldserver.
+    // Handler thread writes, world thread consumes at the master's login.
+    constexpr char CLUSTER_ALTBOTS_PARKED_SUBJECT[] = "playerbots.cluster.altbots.parked";
+    constexpr time_t CLUSTER_ALTBOTS_PARKED_TTL = 300;
+
+    struct ClusterParkedAltbots
+    {
+        std::string names;
+        time_t expires;
+    };
+    std::mutex clusterParkedAltbotsMutex;
+    std::unordered_map<uint32 /*masterLow*/, ClusterParkedAltbots> clusterParkedAltbots;
+
+    void OnClusterAltbotsParked(char const* /*subject*/, char const* payload, int payloadLen)
+    {
+        uint32 masterLow = 0;
+        char names[768] = {};
+
+        std::string data(payload, payloadLen);
+        if (sscanf(data.c_str(), "{\"m\":%u,\"b\":\"%767[^\"]\"}", &masterLow, names) != 2)
+            return;
+
+        std::lock_guard<std::mutex> lock(clusterParkedAltbotsMutex);
+        clusterParkedAltbots[masterLow] = { names, time(nullptr) + CLUSTER_ALTBOTS_PARKED_TTL };
+    }
+
     constexpr char CLUSTER_BG_PULL_SUBJECT[] = "playerbots.cluster.bg.pull";
     constexpr int32 CLUSTER_BG_PULL_COOLDOWN_MS = 30 * 1000;  // per queue key, covers the travel
     constexpr uint32 CLUSTER_BG_PULL_MAX_PER_ASK = 4;         // per provider per request
@@ -1047,6 +1073,43 @@ namespace PlayerbotsCluster
         return sToCloud9Sidecar->ClusterModeEnabled()
             && !sToCloud9Sidecar->IsMapAssigned(mapId);
     }
+
+    void PublishAltbotsParked(uint32 masterLow, std::string const& botNames)
+    {
+        if (!sToCloud9Sidecar->ClusterModeEnabled() || botNames.empty())
+            return;
+
+        char payload[896];
+        int len = snprintf(payload, sizeof(payload), "{\"m\":%u,\"b\":\"%s\"}",
+                           masterLow, botNames.c_str());
+        if (len <= 0 || len >= int(sizeof(payload)))
+            return;
+
+        LOG_INFO("playerbots", "Cluster: master {} leaves with alt bots parked: {}", masterLow, botNames);
+        sToCloud9Sidecar->NatsPublish(CLUSTER_ALTBOTS_PARKED_SUBJECT, std::string(payload, len));
+    }
+
+    std::string TakeParkedAltbots(uint32 masterLow)
+    {
+        std::lock_guard<std::mutex> lock(clusterParkedAltbotsMutex);
+
+        time_t now = time(nullptr);
+        for (auto it = clusterParkedAltbots.begin(); it != clusterParkedAltbots.end();)
+        {
+            if (it->second.expires < now)
+                it = clusterParkedAltbots.erase(it);
+            else
+                ++it;
+        }
+
+        auto it = clusterParkedAltbots.find(masterLow);
+        if (it == clusterParkedAltbots.end())
+            return "";
+
+        std::string names = it->second.names;
+        clusterParkedAltbots.erase(it);
+        return names;
+    }
 }
 
 class PlayerbotsClusterPlayerScript : public PlayerScript
@@ -1128,7 +1191,8 @@ public:
                 sToCloud9Sidecar->NatsSubscribe(MATCHMAKING_INVITED_SUBJECT, &OnClusterBGInvite) &&
                 sToCloud9Sidecar->NatsSubscribe(MATCHMAKING_QUEUED_SUBJECT, &OnClusterBGQueueJoined) &&
                 sToCloud9Sidecar->NatsSubscribe(MATCHMAKING_EXPIRED_SUBJECT, &OnClusterBGInviteExpired) &&
-                sToCloud9Sidecar->NatsSubscribe(CLUSTER_BG_PULL_SUBJECT, &OnClusterBGPull);
+                sToCloud9Sidecar->NatsSubscribe(CLUSTER_BG_PULL_SUBJECT, &OnClusterBGPull) &&
+                sToCloud9Sidecar->NatsSubscribe(CLUSTER_ALTBOTS_PARKED_SUBJECT, &OnClusterAltbotsParked);
 
         UpdateCooldowns(diff);
         ProcessPendingKicks();

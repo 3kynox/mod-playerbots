@@ -441,7 +441,10 @@ public:
     {
         if (player)
             if (PlayerbotMgr* playerbotMgr = GET_PLAYERBOT_MGR(player))
+            {
                 playerbotMgr->UpdateSessions();
+                playerbotMgr->ProcessPendingAltbotReAdd();
+            }
     }
 
     void OnPlayerbotLogout(Player* player) override
@@ -451,7 +454,13 @@ public:
             PlayerbotAI* botAI = PlayerbotsMgr::instance().GetPlayerbotAI(player);
 
             if (botAI == nullptr || IsSelfBot(player))
+            {
+                // BUG-TC9-071: park the active alt bots before the logout
+                // wipes them — if the master reappears on another worldserver
+                // within the TTL (shard transfer), it re-adds them there.
+                playerbotMgr->PublishParkedAltbots();
                 playerbotMgr->LogoutAllBots();
+            }
         }
 
         sRandomPlayerbotMgr.OnPlayerLogout(player);

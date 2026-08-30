@@ -74,6 +74,10 @@ public:
     void OnPlayerLogin(Player* player);
     void CancelLogout();
 
+    // BUG-TC9-071: alt bots follow their master across worldservers.
+    void PublishParkedAltbots();
+    void ProcessPendingAltbotReAdd();
+
     void UpdateAIInternal(uint32 elapsed, bool minimal = false) override;
     void TellError(std::string const botName, std::string const text);
 
@@ -94,6 +98,11 @@ private:
     Player* const master;
     PlayerBotErrorMap errors;
     time_t lastErrorTell;
+
+    // BUG-TC9-071: parked alt bots to re-add once their logout on the
+    // previous worldserver had time to complete (0 = nothing pending).
+    std::string altbotsReAdd;
+    time_t altbotsReAddAt = 0;
 };
 
 class PlayerbotsMgr

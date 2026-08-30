@@ -20,6 +20,8 @@
 
 #include "Define.h"
 
+#include <string>
+
 // ToCloud9 cluster partition helpers shared with the random bot pool.
 namespace PlayerbotsCluster
 {
@@ -30,6 +32,16 @@ namespace PlayerbotsCluster
     // the cluster: that worldserver's own pool picks it up instead, so
     // selecting it here would only trigger a kick/handoff round-trip.
     bool ShouldSkipPoolCandidate(uint32 mapId);
+
+    // BUG-TC9-071: a master switching worldserver (boat, zeppelin, GM
+    // teleport) takes his alt bots down with his session. The leaving server
+    // publishes the active set; every server caches it briefly, and the one
+    // where the master lands re-adds the bots. The short TTL is what keeps a
+    // plain evening logout from resurrecting them at the next morning login.
+    void PublishAltbotsParked(uint32 masterLow, std::string const& botNames);
+
+    // Consumes (and erases) the parked set for this master, "" if none/expired.
+    std::string TakeParkedAltbots(uint32 masterLow);
 }
 
 #endif

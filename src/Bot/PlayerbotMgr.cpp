@@ -25,6 +25,7 @@
 #include "PlayerbotTextMgr.h"
 #include "PlayerbotWorldThreadProcessor.h"
 #include "Playerbots.h"
+#include "PlayerbotsCluster.h"
 #include "RandomPlayerbotMgr.h"
 #include "SharedDefines.h"
 #include "TC9Sidecar.h"
@@ -1662,6 +1663,19 @@ void PlayerbotMgr::OnPlayerLogin(Player* player)
     if (sPlayerbotAIConfig.selfBotLevel > 2)
         HandlePlayerbotCommand("self", player);
 
+    // BUG-TC9-071: this master may have just left another worldserver with
+    // alt bots up (boat, zeppelin, GM teleport) — the leaving server parked
+    // the set on NATS. Re-add them once their logout over there settled.
+    if (sToCloud9Sidecar->ClusterModeEnabled())
+    {
+        std::string parked = PlayerbotsCluster::TakeParkedAltbots(player->GetGUID().GetCounter());
+        if (!parked.empty())
+        {
+            altbotsReAdd = "add " + parked;
+            altbotsReAddAt = time(nullptr) + 5;
+        }
+    }
+
     if (!sPlayerbotAIConfig.botAutologin)
         return;
 
@@ -1686,6 +1700,44 @@ void PlayerbotMgr::OnPlayerLogin(Player* player)
 
         HandlePlayerbotCommand(out.str().c_str(), player);
     }
+}
+
+void PlayerbotMgr::PublishParkedAltbots()
+{
+    if (!sToCloud9Sidecar->ClusterModeEnabled() || !master)
+        return;
+
+    std::ostringstream names;
+    bool first = true;
+    for (PlayerBotMap::const_iterator it = GetPlayerBotsBegin(); it != GetPlayerBotsEnd(); ++it)
+    {
+        Player* bot = it->second;
+        if (!bot || bot->GetGUID() == master->GetGUID())
+            continue;
+
+        if (!first)
+            names << ",";
+        names << bot->GetName();
+        first = false;
+    }
+
+    if (first)
+        return;
+
+    PlayerbotsCluster::PublishAltbotsParked(master->GetGUID().GetCounter(), names.str());
+}
+
+void PlayerbotMgr::ProcessPendingAltbotReAdd()
+{
+    if (!altbotsReAddAt || time(nullptr) < altbotsReAddAt)
+        return;
+
+    std::string command = altbotsReAdd;
+    altbotsReAdd.clear();
+    altbotsReAddAt = 0;
+
+    LOG_INFO("playerbots", "Cluster: re-adding parked alt bots of {}: {}", master->GetName(), command);
+    HandlePlayerbotCommand(command.c_str(), master);
 }
 
 void PlayerbotMgr::TellError(std::string const botName, std::string const text)
