@@ -132,9 +132,13 @@ namespace
         std::vector<ObjectGuid::LowType> humans;
         int32 refillIn;
         int32 ttl;
+        uint32 ejectAttempts;  // re-fill passes spent seating them by ejection
     };
     std::vector<ClusterBGWait> clusterBGWaits;
     constexpr int32 CLUSTER_BG_REFILL_MS = 30 * 1000;
+    // Re-fill passes a wait may spend on ejections (holds last 45 s, so two
+    // passes per batch) before the fill path takes over with a fresh instance.
+    constexpr uint32 CLUSTER_BG_MAX_EJECT_ATTEMPTS = 4;
     // Wait entries expire on invite/expire events, the reconciler's
     // validation, or this bound. The old 4-pass refill budget starved
     // legitimate waits (seen live: reinforcements arrived 18s after the
@@ -142,6 +146,9 @@ namespace
     // guarded is covered by the validation and by pops requiring real
     // capacity anyway.
     constexpr int32 CLUSTER_BG_WAIT_TTL_MS = 30 * 60 * 1000;
+    // Cross-shard pulls for a queue are only asked this long after its last
+    // (re)arming enqueue; the local re-fill goes on for the whole TTL.
+    constexpr int32 CLUSTER_BG_PULL_WINDOW_MS = 5 * 60 * 1000;
 
     // World thread only. Local battleground instances that contain our bots
     // (fed by the force-join/backfill path): the ejection scan only makes
@@ -219,6 +226,23 @@ namespace
     std::mutex clusterPendingBGPullMutex;
     std::vector<ClusterPendingBGPull> clusterPendingBGPulls;
 
+    // Fed by the queue-purge thread, drained on the world thread: the
+    // ejection for waiting humans runs once our bots left their queue.
+    struct ClusterPendingBGEject
+    {
+        uint32 typeId;
+        uint32 minLvl;
+        uint32 maxLvl;
+        TeamId team;
+        uint32 count;
+    };
+    std::mutex clusterPendingBGEjectMutex;
+    std::vector<ClusterPendingBGEject> clusterPendingBGEjects;
+
+    // World thread only. Remote waiting humans seen offline in the DB:
+    // guid -> consecutive reconcile passes.
+    std::unordered_map<ObjectGuid::LowType, uint32> clusterBGWaitOfflineStrikes;
+
     struct BGFillPick
     {
         ObjectGuid::LowType guid;
@@ -229,6 +253,11 @@ namespace
     void RemoveWaitingHuman(ObjectGuid::LowType guidLow);
     void FillBGQueue(uint32 typeId, uint32 minLvl, uint32 maxLvl);
     bool GetLevelAndRace(ObjectGuid::LowType guidLow, uint32& level, uint8& race);
+    bool ResolveWaitingHumanTeam(ObjectGuid::LowType guidLow, uint32 minLvl, uint32 maxLvl, TeamId& team);
+    uint32 WaitingHumansForTeam(uint32 typeId, uint32 minLvl, uint32 maxLvl, TeamId team);
+    uint32 EjectBotsForWaitingHumans(uint32 typeId, uint32 minLvl, TeamId team, uint32 count);
+    bool TrySeatWaitingHumans(uint32 typeId, uint32 minLvl, uint32 maxLvl, TeamId team, uint32 count);
+    void RequestCrossShardBots(uint32 typeId, uint32 minLvl, uint32 maxLvl, uint8 pvpTeamId, uint32 count);
 
     bool IsMapServedByClusterBots(uint32 mapId)
     {
@@ -662,23 +691,27 @@ namespace
 
         uint32 needed[2] = {perFaction, perFaction};  // TEAM_ALLIANCE, TEAM_HORDE
 
-        // The waiting humans hold slots on their own faction. Out-of-bracket
-        // group members are excluded from the count (§ F.6: a level-4 member
-        // was counted in a 10-19 bracket).
+        // The waiting humans hold slots on their own faction (§ F.6 keeps
+        // out-of-bracket LOCAL members out of the count; a remote human is
+        // always counted, see ResolveWaitingHumanTeam).
+        uint32 held[2] = {0, 0};
+        bool pullWindow = false;
         for (ClusterBGWait const& wait : clusterBGWaits)
         {
             if (wait.typeId != typeId || wait.minLvl != minLvl)
                 continue;
 
+            if (wait.ttl > CLUSTER_BG_WAIT_TTL_MS - CLUSTER_BG_PULL_WINDOW_MS)
+                pullWindow = true;
+
             for (ObjectGuid::LowType guidLow : wait.humans)
             {
-                uint32 level = 0;
-                uint8 race = 0;
-                if (!GetLevelAndRace(guidLow, level, race) || level < minLvl || level > maxLvl)
+                TeamId team = TEAM_NEUTRAL;
+                if (!ResolveWaitingHumanTeam(guidLow, minLvl, maxLvl, team))
                     continue;
 
-                TeamId team = Player::TeamIdForRace(race);
-                if (team <= TEAM_HORDE && needed[team])
+                ++held[team];
+                if (needed[team])
                     --needed[team];
             }
         }
@@ -728,6 +761,18 @@ namespace
                 break;
         }
 
+        // The host shard's pool for a bracket can run dry (AB 20-29 on ek:
+        // 6 horde bots for 15 seats, seen live 05/09): ask the other shards
+        // for what is still short while humans wait. The reconciler only did
+        // it for running instances; the pre-pop fill starved in silence.
+        // Bounded to the first minutes after the last enqueue: a human who
+        // left the queue emits no event and would drain the other shards
+        // for the whole wait TTL.
+        if (pullWindow && (held[TEAM_ALLIANCE] || held[TEAM_HORDE]))
+            for (uint8 teamIdx = 0; teamIdx <= 1; ++teamIdx)
+                if (needed[teamIdx])
+                    RequestCrossShardBots(typeId, minLvl, maxLvl, teamIdx == TEAM_HORDE ? 2u : 1u, needed[teamIdx]);
+
         if (picks.empty())
             return;
 
@@ -735,8 +780,10 @@ namespace
             clusterBGQueuedBots[pick.guid] = {CLUSTER_BG_QUEUE_TTL_MS, typeId, minLvl, uint8(pick.pvpTeamId)};
 
         LOG_INFO("playerbots",
-                 "Cluster: filling BG type {} bracket {}-{} queue with {} bots ({} alliance / {} horde still short)",
-                 typeId, minLvl, maxLvl, picks.size(), needed[TEAM_ALLIANCE], needed[TEAM_HORDE]);
+                 "Cluster: filling BG type {} bracket {}-{} queue with {} bots ({} alliance / {} horde still short; "
+                 "{} alliance / {} horde humans hold seats)",
+                 typeId, minLvl, maxLvl, picks.size(), needed[TEAM_ALLIANCE], needed[TEAM_HORDE],
+                 held[TEAM_ALLIANCE], held[TEAM_HORDE]);
 
         // ONE queue entry per faction (leader + members): the matchmaking
         // runs its creation pass after EVERY enqueue and used to pop the
@@ -810,12 +857,110 @@ namespace
         return true;
     }
 
+    // A waiting human holds a seat on its faction. The level is only checked
+    // on a LOCAL player object: the character cache is refreshed by
+    // Unit::SetLevel on the shard where the level-up happened, so a human who
+    // dinged on another shard is still at its old level here (seen live
+    // 05/09: two humans freshly 20 on outland were dropped from an AB 20-29
+    // count on ek, their faction got two bots too many and the match popped
+    // without them). The matchmaking seats the whole group regardless.
+    bool ResolveWaitingHumanTeam(ObjectGuid::LowType guidLow, uint32 minLvl, uint32 maxLvl, TeamId& team)
+    {
+        if (Player* who = ObjectAccessor::FindPlayer(ObjectGuid::Create<HighGuid::Player>(guidLow)))
+        {
+            if (who->GetLevel() < minLvl || who->GetLevel() > maxLvl)
+                return false;  // § F.6: out-of-bracket group member
+            team = who->GetTeamId(true);
+            return team <= TEAM_HORDE;
+        }
+
+        uint32 level = 0;
+        uint8 race = 0;
+        if (!GetLevelAndRace(guidLow, level, race))
+            return false;
+
+        team = Player::TeamIdForRace(race);
+        return team <= TEAM_HORDE;
+    }
+
+    uint32 WaitingHumansForTeam(uint32 typeId, uint32 minLvl, uint32 maxLvl, TeamId team)
+    {
+        uint32 count = 0;
+        for (ClusterBGWait const& wait : clusterBGWaits)
+        {
+            if (wait.typeId != typeId || wait.minLvl != minLvl)
+                continue;
+
+            for (ObjectGuid::LowType guidLow : wait.humans)
+            {
+                TeamId resolved = TEAM_NEUTRAL;
+                if (ResolveWaitingHumanTeam(guidLow, minLvl, maxLvl, resolved) && resolved == team)
+                    ++count;
+            }
+        }
+        return count;
+    }
+
+    // World thread (namespace scope: the fill path asks too). Broadcast the unmet deficit with a safe landing anchor
+    // (a live local bot's spot on one of our maps). Cooldown per queue key:
+    // one ask per travel window, the next reconcile pass re-measures.
+    void RequestCrossShardBots(uint32 typeId, uint32 minLvl, uint32 maxLvl, uint8 pvpTeamId, uint32 count)
+    {
+        uint64 key = (uint64(typeId) << 32) | (uint64(minLvl) << 8) | pvpTeamId;
+        if (clusterBGPullCooldowns.count(key))
+            return;
+
+        Player* anchor = nullptr;
+        for (auto it = sRandomPlayerbotMgr.GetPlayerBotsBegin();
+             it != sRandomPlayerbotMgr.GetPlayerBotsEnd(); ++it)
+        {
+            Player* bot = it->second;
+            if (!bot || !bot->IsInWorld() || !bot->IsAlive() || bot->InBattleground() ||
+                !bot->GetSession() || !bot->GetSession()->IsBot() ||
+                !sToCloud9Sidecar->IsMapAssigned(bot->GetMapId()))
+                continue;
+
+            anchor = bot;
+            break;
+        }
+
+        if (!anchor)
+        {
+            LOG_WARN("playerbots", "Cluster: BG pull skipped, no live local bot to anchor the landing");
+            return;
+        }
+
+        clusterBGPullCooldowns[key] = CLUSTER_BG_PULL_COOLDOWN_MS;
+
+        char payload[256];
+        snprintf(payload, sizeof(payload),
+                 "{\"TypeID\":%u,\"MinLvl\":%u,\"MaxLvl\":%u,\"PvpTeamID\":%u,\"Count\":%u,"
+                 "\"DestMap\":%u,\"X\":%.2f,\"Y\":%.2f,\"Z\":%.2f,\"O\":%.2f}",
+                 typeId, minLvl, maxLvl, uint32(pvpTeamId), count, anchor->GetMapId(),
+                 anchor->GetPositionX(), anchor->GetPositionY(), anchor->GetPositionZ(),
+                 anchor->GetOrientation());
+
+        std::string msg(payload);
+        std::thread([msg]() {
+            if (!sToCloud9Sidecar->NatsPublish(CLUSTER_BG_PULL_SUBJECT, msg))
+                LOG_WARN("playerbots", "Cluster: BG pull publish failed");
+        }).detach();
+
+        LOG_INFO("playerbots", "Cluster: BG pull published (type {} bracket {}-{} team {} need {})",
+                 typeId, minLvl, maxLvl, uint32(pvpTeamId), count);
+    }
+
     // § F.4: a balanced running battleground accepts nobody through the
     // matchmaking backfill — a human queuing against a match full of bots
-    // would never enter it. Free one slot by making a random bot leave; the
-    // matchmaking then re-runs the queue pass (PlayerLeftBattleground) and
-    // seats the waiting human. True = a slot was freed or already exists.
-    bool EjectBotForWaitingHuman(uint32 typeId, uint32 minLvl, TeamId team)
+    // would never enter it. Secure `count` seats for `team` in the first
+    // local bot-filled instance of this queue: existing backfill slots
+    // first, then random bots made to leave (never a flag carrier); the
+    // matchmaking re-runs the queue pass on each PlayerLeftBattleground and
+    // seats the waiting humans. A party needs all its seats at once
+    // (findGroupsForGivenSlots), hence the count — one seat at a time left
+    // a party of 3 in queue behind a 15v15 (05/09). Returns the seats
+    // secured, 0 = no such instance.
+    uint32 EjectBotsForWaitingHumans(uint32 typeId, uint32 minLvl, TeamId team, uint32 count)
     {
         for (auto itr = clusterBGBotInstances.begin(); itr != clusterBGBotInstances.end();)
         {
@@ -840,15 +985,22 @@ namespace
             }
 
             TeamId other = team == TEAM_ALLIANCE ? TEAM_HORDE : TEAM_ALLIANCE;
-            uint32 have = bg->GetPlayersCountByTeam(team);
+            uint32 have = bg->GetPlayersCountByTeam(team) + CountEjectHolds(bg->GetInstanceID(), uint8(team));
             uint32 target = std::min<uint32>(
                 std::max<uint32>(bg->GetMinPlayersPerTeam(), bg->GetPlayersCountByTeam(other)),
                 bg->GetMaxPlayersPerTeam());
-            if (have + CountEjectHolds(bg->GetInstanceID(), uint8(team)) < target)
-                return true;  // a backfill slot already exists, matchmaking seats the human
+            uint32 secured = have < target ? target - have : 0;
+            if (secured >= count)
+                return secured;  // backfill slots already exist, matchmaking seats the humans
 
+            // Pick first, eject after: the leave path may touch the
+            // battleground's player map.
+            std::vector<Player*> candidates;
             for (auto const& pair : bg->GetPlayers())
             {
+                if (secured + candidates.size() >= count)
+                    break;
+
                 Player* member = pair.second;
                 if (!member || !member->GetSession() || !member->GetSession()->IsBot() ||
                     !sRandomPlayerbotMgr.IsRandomBot(member))
@@ -862,14 +1014,22 @@ namespace
                     memberGuid == bg->GetFlagPickerGUID(TEAM_HORDE))
                     continue;  // never yank a flag carrier
 
+                if (!GET_PLAYERBOT_AI(member))
+                    continue;
+
+                candidates.push_back(member);
+            }
+
+            for (Player* member : candidates)
+            {
                 PlayerbotAI* botAI = GET_PLAYERBOT_AI(member);
                 if (!botAI)
                     continue;
 
-                LOG_INFO("playerbots", "Cluster: ejecting bot {} from BG instance {} to seat a waiting player",
-                         member->GetName(), bg->GetInstanceID());
-
+                LOG_INFO("playerbots", "Cluster: ejecting bot {} from BG instance {} to seat a waiting player ({}/{} seats)",
+                         member->GetName(), bg->GetInstanceID(), secured + 1, count);
                 clusterBGEjectHolds.push_back({bg->GetInstanceID(), uint8(team), CLUSTER_BG_EJECT_HOLD_MS});
+                ObjectGuid memberGuid = member->GetGUID();
                 clusterBGEjecting.insert(memberGuid.GetCounter());
                 BGStatusAction::LeaveBG(botAI);
                 // LeaveBG's CMSG path is silently refused while the bot is in
@@ -892,15 +1052,80 @@ namespace
                     clusterBGEjectHolds.pop_back();
                     LOG_WARN("playerbots", "Cluster: ejection of bot {} from BG instance {} FAILED (still seated)",
                              member->GetName(), bg->GetInstanceID());
+                    continue;
                 }
-
-                return left;
+                ++secured;
             }
+            return secured;
+        }
+        return 0;  // no bot-filled instance of this queue: fill path handles it
+    }
 
-            ++itr;
+    // Seat `count` waiting humans of `team` into a running local bot-filled
+    // instance of this queue, if there is one. Our bots still sitting in
+    // that matchmaking queue would take the freed seats first (the
+    // matchmaking iterates a Go map), so they leave the queue before the
+    // ejection, which then runs on the world thread once the purge RPCs
+    // returned. False = no such instance: the fill path (fresh instance)
+    // applies.
+    bool TrySeatWaitingHumans(uint32 typeId, uint32 minLvl, uint32 maxLvl, TeamId team, uint32 count)
+    {
+        if (!count)
+            return true;
+
+        bool hasInstance = false;
+        for (auto const& itr : clusterBGBotInstances)
+        {
+            if (itr.second != typeId)
+                continue;
+
+            Battleground* bg = sBattlegroundMgr->GetBattleground(itr.first, BattlegroundTypeId(typeId));
+            if (!bg || bg->GetMinLevel() != minLvl ||
+                (bg->GetStatus() != STATUS_WAIT_JOIN && bg->GetStatus() != STATUS_IN_PROGRESS))
+                continue;
+
+            if (CountEjectHolds(bg->GetInstanceID(), uint8(team)))
+                return true;  // an ejection for this team is in flight: the backfill seats them
+
+            hasInstance = true;
+            break;
+        }
+        if (!hasInstance)
+            return false;
+
+        uint32 pvpTeamId = team == TEAM_HORDE ? 2u : 1u;
+        std::vector<std::pair<uint64, uint32>> purge;
+        for (auto itr = clusterBGQueuedBots.begin(); itr != clusterBGQueuedBots.end();)
+        {
+            if (itr->second.typeId == typeId && itr->second.minLvl == minLvl && itr->second.pvpTeamId == pvpTeamId)
+            {
+                purge.push_back({uint64(itr->first), typeId});
+                itr = clusterBGQueuedBots.erase(itr);
+            }
+            else
+                ++itr;
         }
 
-        return false;  // no bot-filled instance of this queue: fill path handles it
+        if (purge.empty())
+        {
+            uint32 secured = EjectBotsForWaitingHumans(typeId, minLvl, team, count);
+            LOG_INFO("playerbots",
+                     "Cluster: seating {} waiting human(s) of team {} into a running BG type {} bracket {}-{}: {} seat(s) secured",
+                     count, uint32(team), typeId, minLvl, maxLvl, secured);
+            return secured >= count;
+        }
+
+        LOG_INFO("playerbots",
+                 "Cluster: purging {} queued bot(s) of team {} before seating {} waiting human(s) (BG type {} bracket {}-{})",
+                 purge.size(), uint32(team), count, typeId, minLvl, maxLvl);
+        ClusterPendingBGEject eject{typeId, minLvl, maxLvl, team, count};
+        std::thread([purge, eject]() {
+            for (auto const& entry : purge)
+                sToCloud9Sidecar->RemovePlayerFromBattlegroundQueue(entry.first, entry.second);
+            std::lock_guard<std::mutex> lock(clusterPendingBGEjectMutex);
+            clusterPendingBGEjects.push_back(eject);
+        }).detach();
+        return true;
     }
 
     // Runs on the world thread (delivered through ProcessHooks). A player
@@ -982,25 +1207,30 @@ namespace
                 wait->humans.push_back(guidLow);
         }
 
-        // § F.4: a solo human queuing while a local bot-filled match of this
-        // bracket is running (and balanced) gets a seat by ejection instead
-        // of waiting for a fresh instance. Groups keep the fill path.
-        if (queued.size() == 1)
+        // § F.4: humans queuing while a local bot-filled match of this
+        // bracket is running (and balanced) get seats by ejection instead of
+        // waiting for a fresh instance — solo or party (the party path was
+        // missing: a group of 3 waited behind a 15v15, 05/09).
+        uint32 queuedHumans[2] = {0, 0};
+        for (uint64 guidRaw : queued)
         {
-            ObjectGuid::LowType guidLow = ObjectGuid::LowType(queued[0]);
+            ObjectGuid::LowType guidLow = ObjectGuid::LowType(guidRaw);
             Player* who = ObjectAccessor::FindPlayer(ObjectGuid::Create<HighGuid::Player>(guidLow));
-            if (!who || !who->GetSession() || !who->GetSession()->IsBot())
-            {
-                uint32 level = 0;
-                uint8 race = 0;
-                if (GetLevelAndRace(guidLow, level, race) && level >= minLvl && level <= maxLvl)
-                {
-                    TeamId team = Player::TeamIdForRace(race);
-                    if (team <= TEAM_HORDE && EjectBotForWaitingHuman(uint32(typeId), uint32(minLvl), team))
-                        return;  // seated by ejection/backfill, no fill needed
-                }
-            }
+            if (who && who->GetSession() && who->GetSession()->IsBot())
+                continue;
+
+            TeamId team = TEAM_NEUTRAL;
+            if (ResolveWaitingHumanTeam(guidLow, uint32(minLvl), uint32(maxLvl), team))
+                ++queuedHumans[team];
         }
+
+        bool seated = queuedHumans[TEAM_ALLIANCE] || queuedHumans[TEAM_HORDE];
+        for (uint8 teamIdx = 0; teamIdx <= 1; ++teamIdx)
+            if (queuedHumans[teamIdx] &&
+                !TrySeatWaitingHumans(uint32(typeId), uint32(minLvl), uint32(maxLvl), TeamId(teamIdx), queuedHumans[teamIdx]))
+                seated = false;
+        if (seated)
+            return;  // seated by ejection/backfill, no fill needed
 
         FillBGQueue(uint32(typeId), uint32(minLvl), uint32(maxLvl));
     }
@@ -1198,6 +1428,7 @@ public:
         ProcessPendingKicks();
         ProcessPendingLogins(diff);
         ProcessPendingBGJoins(diff);
+        ProcessPendingBGEjects();
         ProcessBGPulls();
         ProcessBGRefills(diff);
         ProcessBGReconcile(diff);
@@ -1312,54 +1543,6 @@ private:
         }
     }
 
-    // World thread. Broadcast the unmet deficit with a safe landing anchor
-    // (a live local bot's spot on one of our maps). Cooldown per queue key:
-    // one ask per travel window, the next reconcile pass re-measures.
-    void RequestCrossShardBots(uint32 typeId, uint32 minLvl, uint32 maxLvl, uint8 pvpTeamId, uint32 count)
-    {
-        uint64 key = (uint64(typeId) << 32) | (uint64(minLvl) << 8) | pvpTeamId;
-        if (clusterBGPullCooldowns.count(key))
-            return;
-
-        Player* anchor = nullptr;
-        for (auto it = sRandomPlayerbotMgr.GetPlayerBotsBegin();
-             it != sRandomPlayerbotMgr.GetPlayerBotsEnd(); ++it)
-        {
-            Player* bot = it->second;
-            if (!bot || !bot->IsInWorld() || !bot->IsAlive() || bot->InBattleground() ||
-                !bot->GetSession() || !bot->GetSession()->IsBot() ||
-                !sToCloud9Sidecar->IsMapAssigned(bot->GetMapId()))
-                continue;
-
-            anchor = bot;
-            break;
-        }
-
-        if (!anchor)
-        {
-            LOG_WARN("playerbots", "Cluster: BG pull skipped, no live local bot to anchor the landing");
-            return;
-        }
-
-        clusterBGPullCooldowns[key] = CLUSTER_BG_PULL_COOLDOWN_MS;
-
-        char payload[256];
-        snprintf(payload, sizeof(payload),
-                 "{\"TypeID\":%u,\"MinLvl\":%u,\"MaxLvl\":%u,\"PvpTeamID\":%u,\"Count\":%u,"
-                 "\"DestMap\":%u,\"X\":%.2f,\"Y\":%.2f,\"Z\":%.2f,\"O\":%.2f}",
-                 typeId, minLvl, maxLvl, uint32(pvpTeamId), count, anchor->GetMapId(),
-                 anchor->GetPositionX(), anchor->GetPositionY(), anchor->GetPositionZ(),
-                 anchor->GetOrientation());
-
-        std::string msg(payload);
-        std::thread([msg]() {
-            if (!sToCloud9Sidecar->NatsPublish(CLUSTER_BG_PULL_SUBJECT, msg))
-                LOG_WARN("playerbots", "Cluster: BG pull publish failed");
-        }).detach();
-
-        LOG_INFO("playerbots", "Cluster: BG pull published (type {} bracket {}-{} team {} need {})",
-                 typeId, minLvl, maxLvl, uint32(pvpTeamId), count);
-    }
 
     void ProcessBGReconcile(uint32 diff)
     {
@@ -1377,13 +1560,16 @@ private:
             return;
         clusterBGReconcileIn = CLUSTER_BG_RECONCILE_MS;
 
+        std::vector<ObjectGuid::LowType> remoteHumans;
         for (auto itr = clusterBGWaits.begin(); itr != clusterBGWaits.end();)
         {
             std::vector<ObjectGuid::LowType>& humans = itr->humans;
             humans.erase(std::remove_if(humans.begin(), humans.end(),
-                [](ObjectGuid::LowType guidLow)
+                [&remoteHumans](ObjectGuid::LowType guidLow)
                 {
                     Player* who = ObjectAccessor::FindPlayer(ObjectGuid::Create<HighGuid::Player>(guidLow));
+                    if (!who)
+                        remoteHumans.push_back(guidLow);
                     return who && who->InBattleground();
                 }), humans.end());
             if (humans.empty())
@@ -1391,6 +1577,7 @@ private:
             else
                 ++itr;
         }
+        PruneOfflineWaitingHumans(remoteHumans);
 
         struct ReconcilePick
         {
@@ -1431,6 +1618,12 @@ private:
                         ++have;
 
                 if (have >= target)
+                    continue;
+
+                // Humans waiting in this queue get the free seats (ejection
+                // + backfill), not more bots: the reconciler sealed the last
+                // seat of a 15v15 while a party of 3 waited (05/09).
+                if (WaitingHumansForTeam(typeId, minLvl, maxLvl, TeamId(teamIdx)))
                     continue;
 
                 uint32 deficit = target - have;
@@ -1503,10 +1696,93 @@ private:
                 itr->refillIn = CLUSTER_BG_REFILL_MS;
                 LOG_INFO("playerbots", "Cluster: re-fill pass for BG type {} bracket {}-{} ({} humans waiting)",
                          itr->typeId, itr->minLvl, itr->maxLvl, itr->humans.size());
-                FillBGQueue(itr->typeId, itr->minLvl, itr->maxLvl);
+
+                // Humans already waiting when a bot-filled match of their
+                // bracket popped (or who queued into one) are seated by
+                // ejection from here — the joined event only covered the
+                // arrival. Bounded: after the attempts a fresh instance is
+                // the way.
+                bool seated = false;
+                if (itr->ejectAttempts < CLUSTER_BG_MAX_EJECT_ATTEMPTS)
+                {
+                    uint32 waiting[2] = {WaitingHumansForTeam(itr->typeId, itr->minLvl, itr->maxLvl, TEAM_ALLIANCE),
+                                         WaitingHumansForTeam(itr->typeId, itr->minLvl, itr->maxLvl, TEAM_HORDE)};
+                    seated = waiting[TEAM_ALLIANCE] || waiting[TEAM_HORDE];
+                    for (uint8 teamIdx = 0; teamIdx <= 1; ++teamIdx)
+                        if (waiting[teamIdx] &&
+                            !TrySeatWaitingHumans(itr->typeId, itr->minLvl, itr->maxLvl, TeamId(teamIdx), waiting[teamIdx]))
+                            seated = false;
+                    if (seated)
+                        ++itr->ejectAttempts;
+                }
+                if (!seated)
+                    FillBGQueue(itr->typeId, itr->minLvl, itr->maxLvl);
             }
 
             ++itr;
+        }
+    }
+
+    // World thread. Ejections deferred behind a queue purge (TrySeatWaitingHumans).
+    void ProcessPendingBGEjects()
+    {
+        std::vector<ClusterPendingBGEject> ejects;
+        {
+            std::lock_guard<std::mutex> lock(clusterPendingBGEjectMutex);
+            ejects.swap(clusterPendingBGEjects);
+        }
+
+        for (ClusterPendingBGEject const& eject : ejects)
+        {
+            uint32 secured = EjectBotsForWaitingHumans(eject.typeId, eject.minLvl, eject.team, eject.count);
+            LOG_INFO("playerbots",
+                     "Cluster: seating {} waiting human(s) of team {} into a running BG type {} bracket {}-{}: {} seat(s) secured",
+                     eject.count, uint32(eject.team), eject.typeId, eject.minLvl, eject.maxLvl, secured);
+        }
+    }
+
+    // World thread. No "left the queue" event exists: a remote human who
+    // logged out kept its wait alive for the whole TTL and every re-fill
+    // pass kept feeding bots (now also cross-shard pulls) to a queue nobody
+    // waits in (05/09, 30 min). The owning shard clears characters.online at
+    // logout; two consecutive offline passes (20 s) tell a logout from a
+    // shard-to-shard transfer.
+    void PruneOfflineWaitingHumans(std::vector<ObjectGuid::LowType> const& remoteHumans)
+    {
+        if (remoteHumans.empty())
+        {
+            clusterBGWaitOfflineStrikes.clear();
+            return;
+        }
+
+        std::string list;
+        for (ObjectGuid::LowType guidLow : remoteHumans)
+            list += (list.empty() ? "" : ",") + std::to_string(guidLow);
+
+        std::unordered_set<ObjectGuid::LowType> offline;
+        if (QueryResult result = CharacterDatabase.Query("SELECT guid FROM characters WHERE online = 0 AND guid IN ({})", list))
+        {
+            do
+                offline.insert((*result)[0].Get<uint32>());
+            while (result->NextRow());
+        }
+
+        for (auto itr = clusterBGWaitOfflineStrikes.begin(); itr != clusterBGWaitOfflineStrikes.end();)
+        {
+            if (!offline.count(itr->first))
+                itr = clusterBGWaitOfflineStrikes.erase(itr);
+            else
+                ++itr;
+        }
+
+        for (ObjectGuid::LowType guidLow : offline)
+        {
+            if (++clusterBGWaitOfflineStrikes[guidLow] < 2)
+                continue;
+
+            LOG_INFO("playerbots", "Cluster: waiting human guid {} is offline, dropped from the BG re-fill bookkeeping", guidLow);
+            RemoveWaitingHuman(guidLow);
+            clusterBGWaitOfflineStrikes.erase(guidLow);
         }
     }
 
